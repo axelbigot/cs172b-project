@@ -36,3 +36,9 @@ The main program will do the following:
 The model should automatically have a `model` argument option in the main program CLI with the value of `name` and can be ran just like the example.
 
 > Note: the `RANDOM_SEED` variable in `src/constants.py` should be used anywhere where random state is configured (torch, rand, etc...) for reproducibility reasons.
+
+## Unified TODO:
+
+- Will add model saving to disk so that trained models persist
+- Will add train, test, validation data splits
+- Will add args to train vs test vs validate
