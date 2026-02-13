@@ -15,7 +15,11 @@ From [FMA](https://github.com/mdeff/fma/tree/master):
 
 Then run using a specific model, for instance the demo:
 
-`python main.py example`
+`python main.py train example`
+
+You can also test a specific model based on its current training:
+
+`python main.py test example`
 
 You can view tensorboard visuals with:
 
