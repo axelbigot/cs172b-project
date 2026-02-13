@@ -5,7 +5,8 @@ import numpy as np
 
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
-from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data import DataLoader, Subset
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from os import PathLike
 
@@ -152,6 +153,12 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 		epoch = 0
 
 		path = DATA_DIRECTORY / f'model_trained_{self.name()}'
+		log_dir = DATA_DIRECTORY / f'runs/{self.name()}'
+
+		log_dir.mkdir(parents=True, exist_ok=True)
+
+		writer = SummaryWriter(log_dir=str(log_dir))
+
 		if path.exists():
 			cp = torch.load(path, map_location=device)
 
@@ -215,6 +222,11 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 				f'\tTrain loss: {train_loss:6f}, accuracy: {(train_accuracy * 100):6f}%\n'
 				f'\tValidation loss: {val_loss:6f}, accuracy: {(val_accuracy * 100):6f}%'
 			)
+
+			writer.add_scalar('Loss/Train', train_loss, ep)
+			writer.add_scalar('Accuracy/Train', train_accuracy, ep)
+			writer.add_scalar('Loss/Validation', val_loss, ep)
+			writer.add_scalar('Accuracy/Validation', val_accuracy, ep)
 
 			torch.save({
 				'model_state_dict': self.state_dict(),

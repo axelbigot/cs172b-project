@@ -13,7 +13,7 @@ class ExampleFMAModel(AbstractFMAGenreModule):
 	@classmethod
 	def train_generic(cls, train_dataset, val_dataset):
 		model = ExampleFMAModel()
-		model.fma_train(train_dataset, val_dataset, batch_size=4, num_epochs=1)
+		model.fma_train(train_dataset, val_dataset, batch_size=4, num_epochs=5)
 
 	@classmethod
 	def name(cls):

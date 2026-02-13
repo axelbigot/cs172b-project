@@ -17,6 +17,12 @@ Then run using a specific model, for instance the demo:
 
 `python main.py example`
 
+You can view tensorboard visuals with:
+
+`tensorboard --logdir data/runs/`
+
+With `model_name` being the provided name of the model (`example`)
+
 ## Unified Process
 
 The main program will do the following:
