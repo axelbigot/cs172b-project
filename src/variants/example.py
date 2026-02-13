@@ -10,13 +10,13 @@ from src.constants import *
 
 
 class ExampleFMAModel(AbstractFMAGenreModule):
-	@staticmethod
-	def train_generic():
+	@classmethod
+	def train_generic(cls, train_dataset, val_dataset):
 		model = ExampleFMAModel()
-		model.fma_train(batch_size=4, num_epochs=1)
+		model.fma_train(train_dataset, val_dataset, batch_size=4, num_epochs=1)
 
-	@staticmethod
-	def name():
+	@classmethod
+	def name(cls):
 		return 'example'
 
 	def __init__(self, *args, **kwargs):
