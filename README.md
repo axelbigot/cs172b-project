@@ -25,17 +25,19 @@ You can view tensorboard visuals with:
 
 `tensorboard --logdir data/runs/`
 
-With `model_name` being the provided name of the model (`example`)
-
 ## Unified Process
 
 The main program will do the following:
 1. Dynamically retrieve the model class to be run based on the `model` arg
-2. Invoke the model's static `train_generic` method, which should delegate to the model's `fma_train` method.
-3. The `fma_train` method will instantiate an instance of the dataset (`VariableFMADataset`) and create a data loader for it.
-4. The dataset will unzip `fma_metadata.zip` and `fma_small.zip` to `data/` if not already extracted
-5. The dataset will load metadata CSVs into memory using `pandas` and restrict to the `small` subset of FMA
-6. Common training loop in `fma_train` will begin. The dataloader will retrieve `FMATrack` instances of `batch_size` and collate them to `FMATrackBatch`, which is what is provided to models' `forward()` method. This object contains an aggregate of `FMATrack` scalars as tensors, as well as a raw array of audio bytes which certain models may need to preprocess (i.e. pad) to produce torch-compatible tensors. When the dataloader internally calls the dataset's `__getitem__`, audio files will be trimmed to a uniformly random sequence of 10-30s (at any point in the audio).
+2. Instantiate an instance of the dataset (`VariableFMADataset`).
+3. The dataset will unzip `fma_metadata.zip` and `fma_small.zip` to `data/` if not already extracted
+4. The dataset will load metadata CSVs into memory using `pandas` and restrict to the `small` subset of FMA
+5. Dataset will be split into train and test splits.
+6. Invoke the model's static `train_generic` or `test_generic` method depending on the `action` cli arg, which should delegate to the model's `fma_train`/`fma_test` method, respectively.
+7. The `fma_train`/`fma_test` method will create a data loader for the dataset (train/test) with the train dataset being split again between train and validation.
+8. `fma_train`/`fma_test` method will load existing model state from disk, if available.
+9. Common training/testing loop in `fma_train`/`fma_test` will begin. The dataloader will retrieve `FMATrack` instances of `batch_size` and collate them to `FMATrackBatch`, which is what is provided to models' `forward()` method. This object contains an aggregate of `FMATrack` scalars as tensors, as well as a raw array of audio bytes which certain models may need to preprocess (i.e. pad) to produce torch-compatible tensors. When the dataloader internally calls the dataset's `__getitem__`, audio files will be trimmed to a uniformly random sequence of 10-30s (at any point in the audio).
+10. `fma_test` will output testing accuracy while `fma_train` will periodically output train/validation loss and accuracy and save the model state to disk per epoch.
 
 ## Adding a Model
 
@@ -47,8 +49,6 @@ The model should automatically have a `model` argument option in the main progra
 
 > Note: the `RANDOM_SEED` variable in `src/constants.py` should be used anywhere where random state is configured (torch, rand, etc...) for reproducibility reasons.
 
-## Unified TODO:
+## Unified TODO
 
-- Will add model saving to disk so that trained models persist
-- Will add train, test, validation data splits
-- Will add args to train vs test vs validate
+- Use `RANDOM_SEED` for dataset split
