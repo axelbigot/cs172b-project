@@ -9,6 +9,10 @@ RANDOM_SEED = 1
 
 # Number of genres (output space)
 NUM_CLASSES = 8
+# Validation frac split
+VAL_SPLIT = 0.1
+# Test frac split
+TEST_SPLIT = 0.2
 
 ############################## DATASET ##############################
 
