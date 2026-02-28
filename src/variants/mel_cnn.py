@@ -67,7 +67,7 @@ class MelCNNFMAModel(AbstractFMAGenreModule):
 		S_norm = (S_db - mean) / std
 		return S_norm
 
-	def forward(self, batch: FMATrackBatch) -> torch.Tensor:
+	def forward(self, batch_X: List[torch.FloatTensor]) -> torch.Tensor:
 		mel_list = []
 		for a in batch.audios:
 			arr = a.detach().cpu().numpy().astype(np.float32)

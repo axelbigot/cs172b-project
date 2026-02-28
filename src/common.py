@@ -9,46 +9,17 @@ from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from os import PathLike
+from typing import List, Tuple
 
 from src.constants import *
-from src.fma import VariableFMADataset, FMATrack
+from src.fma import VariableFMADataset
 
 
-@dataclass
-class FMATrackBatch:
-	"""_summary_ Batched FMATracks.
+def audio_genre_collate(batch: List[Tuple[torch.FloatTensor, torch.LongTensor]]) -> Tuple[List[torch.FloatTensor], torch.LongTensor]:
+	audios = [audio for audio, _ in batch]
+	labels = torch.stack([genre for _, genre in batch])
 
-	Note that the `audios` member is a list of variable-length tensors and may need some preprocessing
-	for certain models (in `forward`).
-	"""
-	audios: list[torch.Tensor]
-	lengths: torch.Tensor
-	track_ids: torch.Tensor
-	genres: torch.Tensor
-	features: torch.Tensor
-	echonests: torch.Tensor
-
-def fma_track_collate(batch: list[FMATrack]) -> FMATrackBatch:
-	"""_summary_ Collation function for batching FMATracks.
-
-	Parameters
-	----------
-	batch : list[FMATrack]
-			_description_ Raw FMATracks in the batch.
-
-	Returns
-	-------
-	FMATrackBatch
-			_description_ Batched FMATracks.
-	"""
-	return FMATrackBatch(
-		audios=[torch.tensor(b.audio) for b in batch],
-		lengths=torch.tensor([b.length for b in batch], dtype=torch.float32),
-		track_ids=torch.tensor([b.track_id for b in batch], dtype=torch.int32),
-		genres=torch.tensor([b.genre for b in batch], dtype=torch.long),
-		features=torch.from_numpy(np.stack([b.features for b in batch], axis=0)).float(),
-    echonests=torch.from_numpy(np.stack([b.echonest for b in batch], axis=0)).float()
-	)
+	return audios, labels
 
 class AbstractFMAGenreModule(nn.Module, ABC):
 	@classmethod
@@ -94,13 +65,13 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 		pass
 	
 	@abstractmethod
-	def forward(self, track: FMATrackBatch) -> torch.Tensor:
+	def forward(self, x: List[torch.Tensor]) -> torch.Tensor:
 		"""_summary_ Forward method of the model.
 
 		Parameters
 		----------
-		track : FMATrackBatch
-				_description_ Batched FMA tracks.
+		x : List[torch.Tensor]
+				_description_ Batched audio byte tensors (variable length).
 
 		Returns
 		-------
@@ -180,17 +151,17 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 			train_dataset,
 			batch_size=batch_size,
 			shuffle=True,
-			collate_fn=fma_track_collate
+			collate_fn=audio_genre_collate
 		)
 
 		val_loader = DataLoader(
 			val_dataset,
 			batch_size=batch_size,
-			shuffle=True,
-			collate_fn=fma_track_collate
+			shuffle=False,
+			collate_fn=audio_genre_collate
 		)
 
-		for ep in range(epoch, num_epochs):
+		for ep in tqdm(range(epoch, num_epochs), desc='Total Epochs'):
 			epoch = ep
 
 			self.train()
@@ -198,19 +169,19 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 			n_correct = 0
 			total = 0
 
-			for batch in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{num_epochs}'):
-				batch = self.batch_to_device_(batch, device)
+			for batch in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{num_epochs}', leave=False):
+				batch_X, batch_y = self.batch_to_device_(batch, device)
 
 				optimizer.zero_grad()
-				outputs = self(batch)
-				loss = criterion(outputs, batch.genres)
+				outputs = self(batch_X)
+				loss = criterion(outputs, batch_y)
 				loss.backward()
 				optimizer.step()
 
-				train_loss += loss.item() * len(batch.track_ids)
+				train_loss += loss.item() * len(batch_y)
 				preds = outputs.argmax(1)
-				n_correct += (preds == batch.genres).sum().item()
-				total += len(batch.track_ids)
+				n_correct += (preds == batch_y).sum().item()
+				total += len(batch_y)
 
 			train_accuracy = n_correct / total
 			train_loss /= total
@@ -237,6 +208,7 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 	def fma_test(
 		self, 
 		test_dataset: Subset, 
+		batch_size=16,
 		device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 	) -> float:
 		path = DATA_DIRECTORY / f'model_trained_{self.name()}'
@@ -246,8 +218,9 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 		test_loader = DataLoader(
 			test_dataset,
-			shuffle=True,
-			collate_fn=fma_track_collate
+			shuffle=False,
+			batch_size=batch_size,
+			collate_fn=audio_genre_collate
 		)
 		
 		self.to(device)
@@ -257,13 +230,13 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 		total = 0
 
 		for batch in tqdm(test_loader, desc=f'Testing in progress'):
-			batch = self.batch_to_device_(batch, device)
+			batch_X, batch_y = self.batch_to_device_(batch, device)
 
-			logits = self(batch)
+			logits = self(batch_X)
 			preds = logits.argmax(dim=1)
 
-			correct += (preds == batch.genres).sum().item()
-			total += batch.genres.size(0)
+			correct += (preds == batch_y).sum().item()
+			total += batch_y.size(0)
 
 		return correct / total
 
@@ -281,27 +254,21 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 		total = 0
 
 		for batch in loader:
-			batch = self.batch_to_device_(batch, device)
-			outputs = self(batch)
+			batch_X, batch_y = self.batch_to_device_(batch, device)
+			outputs = self(batch_X)
 
-			loss = criterion(outputs, batch.genres)
-			total_loss += loss.item() * len(batch.track_ids)
+			loss = criterion(outputs, batch_y)
+			total_loss += loss.item() * len(batch_y)
 
 			preds = outputs.argmax(dim=1)
-			n_correct += (preds == batch.genres).sum().item()
-			total += len(batch.track_ids)
+			n_correct += (preds == batch_y).sum().item()
+			total += len(batch_y)
 
 		accuracy = n_correct / total
 		avg_loss = total_loss / total
 
 		return avg_loss, accuracy
 
-	def batch_to_device_(self, batch: FMATrackBatch, device: str) -> FMATrackBatch:
-		return FMATrackBatch(
-			audios=[a.to(device) for a in batch.audios],
-			lengths=batch.lengths.to(device),
-			track_ids=batch.track_ids.to(device),
-			genres=batch.genres.to(device),
-			features=batch.features.to(device),
-			echonests=batch.echonests.to(device)
-		)
+	def batch_to_device_(self, batch: Tuple[List[torch.FloatTensor], torch.LongTensor], device: str) -> Tuple[List[torch.FloatTensor], torch.LongTensor]:
+		audios = [x.to(device) for x in batch[0]]
+		return (audios, batch[1].to(device))

@@ -13,7 +13,7 @@ class ExampleFMAModel(AbstractFMAGenreModule):
 	@classmethod
 	def train_generic(cls, train_dataset, val_dataset):
 		model = ExampleFMAModel()
-		model.fma_train(train_dataset, val_dataset, batch_size=4, num_epochs=5)
+		model.fma_train(train_dataset, val_dataset, batch_size=4, num_epochs=100)
 
 	@classmethod
 	def name(cls):
@@ -21,9 +21,9 @@ class ExampleFMAModel(AbstractFMAGenreModule):
 
 	def __init__(self, *args, **kwargs):
 		super().__init__(*args, **kwargs)
-		self.fc_ = nn.Linear(518, NUM_CLASSES)
+		self.fc_ = nn.Linear(64, NUM_CLASSES)
 
-	def forward(self, track):
-		x = track.features.view(track.features.size(0), -1)
-		logits = self.fc_(x)
+	def forward(self, batch_X: List[torch.FloatTensor]):
+		features = torch.stack([x[:64] for x in batch_X], dim=0).to(batch_X[0].device)
+		logits = self.fc_(features)
 		return logits

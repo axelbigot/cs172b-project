@@ -4,5 +4,5 @@ from src.variants.mel_cnn import *
 
 __all__ = [
 	'ExampleFMAModel',
-	'MelCNNFMAModel'
+	# 'MelCNNFMAModel'
 ]
