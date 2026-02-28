@@ -46,7 +46,7 @@ class VariableFMADataset(Dataset):
 		self.fma_metadata_out_ = Path(fma_metadata_out) / 'fma_metadata'
 		self.fma_small_out_ = Path(fma_small_out) / 'fma_small'
 
-		cache_out_ = Path(DATA_DIR / f'{self.__class__.__name__}-audio-cache.pt')
+		cache_out_ = Path(DATA_DIR / f'VariableFMADataset-audio-cache.pt')
 
 		fma_metadata_zip = Path(fma_metadata_zip)
 		fma_small_zip = Path(fma_small_zip)

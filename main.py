@@ -9,7 +9,7 @@ import argparse
 from torch.utils.data import DataLoader, random_split
 
 from src.common import AbstractFMAGenreModule
-from src.fma import VariableFMADataset
+from src.fma import VariableFMADataset, NoiseVariableFMADataset
 from src.variants import *
 from src.constants import *
 
@@ -31,7 +31,7 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
 
-    dataset = VariableFMADataset()
+    dataset = NoiseVariableFMADataset()
 
     n = len(dataset)
 

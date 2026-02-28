@@ -8,7 +8,7 @@ RANDOM_SEED = 1
 ############################### MODEL ###############################
 
 # Number of genres (output space)
-NUM_CLASSES = 8
+NUM_CLASSES = 9
 # Validation frac split
 VAL_SPLIT = 0.1
 # Test frac split
