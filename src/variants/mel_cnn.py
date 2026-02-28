@@ -48,7 +48,12 @@ class MelCNNFMAModel(AbstractFMAGenreModule):
 		self.feature_extractor = nn.Sequential(*layers)
 		self.classifier = nn.Linear(channels[-1], NUM_CLASSES)
 
-	def compute_mel(self, audio: np.ndarray) -> np.ndarray:
+		self.mel_cache_ = {}
+
+	def compute_mel(self, audio: np.ndarray, aid: int) -> np.ndarray:
+		if aid in self.mel_cache_:
+			return self.mel_cache_[aid]
+		
 		if audio.dtype != np.float32:
 			audio = audio.astype(np.float32)
 		S = librosa.feature.melspectrogram(
@@ -65,15 +70,17 @@ class MelCNNFMAModel(AbstractFMAGenreModule):
 		if std < 1e-6:
 			std = 1.0
 		S_norm = (S_db - mean) / std
+
+		self.mel_cache_[aid] = S_norm
 		return S_norm
 
-	def forward(self, batch_X: List[torch.FloatTensor]) -> torch.Tensor:
+	def forward(self, batch_X: List[torch.FloatTensor], ids: List[int]) -> torch.Tensor:
 		mel_list = []
-		for a in batch.audios:
+		for a, aid in zip(batch_X, ids):
 			arr = a.detach().cpu().numpy().astype(np.float32)
 			if arr.ndim > 1:
 				arr = np.mean(arr, axis=0)
-			mel = self.compute_mel(arr)
+			mel = self.compute_mel(arr, aid)
 			tensor = torch.from_numpy(mel).unsqueeze(0)
 			mel_list.append(tensor)
 

@@ -103,9 +103,9 @@ class VariableFMADataset(Dataset):
 				self.audio_cache_.append((crop, genre))
 			torch.save(self.audio_cache_, cache_out_)
 
-	def __getitem__(self, index) -> Tuple[torch.FloatTensor, torch.LongTensor]:
+	def __getitem__(self, index: int) -> Tuple[torch.FloatTensor, torch.LongTensor, int]:
 		audio, genre = self.audio_cache_[index]
-		return audio, genre
+		return audio, genre, index
 	
 	def __len__(self):
 		return len(self.audio_cache_)

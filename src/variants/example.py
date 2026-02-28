@@ -23,7 +23,7 @@ class ExampleFMAModel(AbstractFMAGenreModule):
 		super().__init__(*args, **kwargs)
 		self.fc_ = nn.Linear(64, NUM_CLASSES)
 
-	def forward(self, batch_X: List[torch.FloatTensor]):
+	def forward(self, batch_X: List[torch.FloatTensor], ids: List[int]):
 		features = torch.stack([x[:64] for x in batch_X], dim=0).to(batch_X[0].device)
 		logits = self.fc_(features)
 		return logits
