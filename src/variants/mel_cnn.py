@@ -16,7 +16,7 @@ class MelCNNFMAModel(AbstractFMAGenreModule):
 
 	@classmethod
 	def name(cls):
-		return 'mel-cnn'
+		return 'mel-cnn-old'
 
 	def __init__(
 		self,
@@ -46,7 +46,7 @@ class MelCNNFMAModel(AbstractFMAGenreModule):
 		layers.append(nn.AdaptiveAvgPool2d((1, 1)))
 
 		self.feature_extractor = nn.Sequential(*layers)
-		self.classifier = nn.Linear(channels[-1], NUM_CLASSES)
+		self.classifier = nn.Linear(channels[-1], 8)
 
 		self.mel_cache_ = {}
 

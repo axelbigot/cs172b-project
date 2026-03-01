@@ -9,45 +9,74 @@ import argparse
 from torch.utils.data import DataLoader, random_split
 
 from src.common import AbstractFMAGenreModule
-from src.fma import VariableFMADataset, NoiseVariableFMADataset
+from src.fma import VariableFMADataset, NoiseVariableFMADataset, compare_splits
 from src.variants import *
 from src.constants import *
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run an FMA model')
+    subparsers = parser.add_subparsers(dest='action', required=True)
     
     model_names = [cls.name() for cls in AbstractFMAGenreModule.__subclasses__()]
-    parser.add_argument(
-        'action', 
-        choices=['train', 'test'], 
-        help='The action to perform on the model'
-    )
-    parser.add_argument(
+
+    train_parser = subparsers.add_parser('train')
+    train_parser.add_argument(
         'model',
         choices=model_names,
-        help='The FMA model to run'
+        help='The FMA model to train'
     )
+
+    test_parser = subparsers.add_parser('test')
+    test_parser.add_argument(
+        'model',
+        choices=model_names,
+        help='The FMA model to test'
+    )
+
+    analyze_parser = subparsers.add_parser('analyze-ds')
+
+    for p in [train_parser, test_parser, analyze_parser]:
+        p.add_argument(
+            '--frac',
+            type=float,
+            default=1.0,
+            help='Fraction of dataset to use [0,1]'
+        )
     
     args = parser.parse_args()
 
-    dataset = NoiseVariableFMADataset()
+    frac = args.frac
 
-    n = len(dataset)
+    if args.action == 'analyze-ds':
+        logging.info(f'[MAIN] (Re)Generating dataset analysis')
+        train_ds = VariableFMADataset(split='training', downsample_frac=frac)
+        val_ds = VariableFMADataset(split='validation', downsample_frac=frac, genre_encoder=train_ds.genre_encoder)
+        test_ds = VariableFMADataset(split='test', downsample_frac=frac, genre_encoder=train_ds.genre_encoder)
 
-    test_sz = int(n * TEST_SPLIT)
-    val_sz = int(n * VAL_SPLIT)
-    train_sz = n - test_sz - val_sz
+        trn_an = train_ds.analyzer()
+        val_an = val_ds.analyzer()
+        tst_an = test_ds.analyzer()
 
-    train_ds, val_ds, test_ds = random_split(dataset, [train_sz, val_sz, test_sz])
+        for an in [trn_an, val_an, tst_an]:
+            an.simple()
+            an.visual()
 
-    ModelClass = next(cls for cls in AbstractFMAGenreModule.__subclasses__() if cls.name() == args.model)
+        compare_splits(trn_an, val_an, tst_an)
+    else:
+        ModelClass = next(cls for cls in AbstractFMAGenreModule.__subclasses__() if cls.name() == args.model)
+        train_ds = VariableFMADataset(split='training', downsample_frac=frac)
 
-    if args.action == 'train':
-        logging.info(f'[MAIN] Training model {ModelClass.name()} ({ModelClass.__name__})')
-        ModelClass.train_generic(train_dataset=train_ds, val_dataset=val_ds)
-    elif args.action == 'test':
-        logging.info(f'[MAIN] Testing model {ModelClass.name()} ({ModelClass.__name__})')
-        ModelClass.test_generic(test_dataset=test_ds)
+        if args.action == 'train':
+            logging.info(f'[MAIN] Training model {ModelClass.name()} ({ModelClass.__name__})')
+            val_ds = VariableFMADataset(split='validation', downsample_frac=frac, genre_encoder=train_ds.genre_encoder)
+
+            ModelClass.train_generic(train_dataset=train_ds, val_dataset=val_ds)
+        elif args.action == 'test':
+            logging.info(f'[MAIN] Testing model {ModelClass.name()} ({ModelClass.__name__})')
+            test_ds = VariableFMADataset(split='test', downsample_frac=frac, genre_encoder=train_ds.genre_encoder)
+
+            ModelClass.test_generic(test_dataset=test_ds)
+
 
     logging.info(f'[MAIN] Graceful end. Goodbye!')
