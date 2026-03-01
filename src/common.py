@@ -67,7 +67,8 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 	def collate_fn(cls):
 		return audio_genre_collate
 	
-	def __init__(self, tag: str):
+	def __init__(self, tag: str, *args, **kwargs):
+		super().__init__(*args, **kwargs)
 		self.tag = tag
 	
 	@abstractmethod
@@ -88,6 +89,9 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 	def transform_batch(self, dataset, x, ids):
 		return x
+	
+	def get_idstr(self, dataset: VariableFMADataset):
+		return f'model_trained_{self.name()}{f"_tag-{self.tag}" if len(self.tag) else ""}_{dataset.__class__.__name__}_frac-{dataset.dowsample_frac}'
 
 	def fma_train(
 		self,
@@ -225,6 +229,16 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 			writer.add_scalar('Accuracy/Train', train_accuracy, ep)
 			writer.add_scalar('Loss/Validation', val_loss, ep)
 			writer.add_scalar('Accuracy/Validation', val_accuracy, ep)
+
+			if ep % 20 == 0:
+				idstr = self.get_idstr(train_dataset)
+				dir = Path('analysis') / 'model' / 'validation' / idstr
+				ep_dir = dir / f'epoch_{ep}'
+
+				if ep == 0:
+					# remove all contents of dir
+					pass
+				ep_dir.mkdir(exist_ok=True, parents=True)
 
 			torch.save({
 				'model_state_dict': self.state_dict(),
