@@ -14,13 +14,8 @@ def mfcc_collate(batch: List[Tuple[torch.Tensor, torch.LongTensor, int]]):
 
 class MFCC_CNNFMAModel(AbstractFMAGenreModule):
     @classmethod
-<<<<<<< HEAD
-    def train_generic(cls, train_dataset, val_dataset):
-        model = cls().fma_train(train_dataset, val_dataset, batch_size = 16, num_epochs = 1500)
-=======
     def collate_fn(cls):
         return mfcc_collate
->>>>>>> origin/main
     
     @classmethod
     def train_generic(cls, train_dataset, val_dataset, tag):
@@ -36,10 +31,11 @@ class MFCC_CNNFMAModel(AbstractFMAGenreModule):
     def name(cls):
         return 'mfcc-cnn'
 
-    def __init__(self, num_classes: int, conv_channels: tuple[int, ...] = (16, 32, 64, 128), **kwargs):
+    def __init__(self, num_classes: int, conv_channels: tuple[int, ...] = (16, 32, 64, 128), dropout_p: float = 0.5, **kwargs):
         super().__init__(**kwargs)
 
         self.classifier = nn.Linear(conv_channels[-1], num_classes)
+        self.dropout = nn.Dropout(p = dropout_p)
 
         layers = []
         input_ch = 1
@@ -59,5 +55,6 @@ class MFCC_CNNFMAModel(AbstractFMAGenreModule):
     def forward(self, batch_X: torch.Tensor, ids: List[int] = None) -> torch.Tensor:
         x = batch_X.to(next(self.parameters()).device)
         features = self.feature_extractor(x).flatten(1)
+        features = self.dropout(features)
         return self.classifier(features)
     
