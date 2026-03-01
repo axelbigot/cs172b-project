@@ -43,6 +43,14 @@ if __name__ == '__main__':
         help='The FMA model to test'
     )
 
+    for p in [train_parser, test_parser]:
+        p.add_argument(
+            '--tag',
+            type=str,
+            default='',
+            help='Specify a tag to append to the name of the model to make it unique'
+        )
+
     analyze_parser = subparsers.add_parser('analyze-ds')
 
     for p in [train_parser, test_parser, analyze_parser]:
@@ -87,7 +95,7 @@ if __name__ == '__main__':
             logging.info(f'[MAIN] Training model {ModelClass.name()} ({ModelClass.__name__})')
             val_ds = DatasetClass(split='validation', downsample_frac=frac, genre_encoder=train_ds.genre_encoder)
 
-            ModelClass.train_generic(train_dataset=train_ds, val_dataset=val_ds)
+            ModelClass.train_generic(train_dataset=train_ds, val_dataset=val_ds, tag=args.tag)
         elif args.action == 'test':
             logging.info(f'[MAIN] Testing model {ModelClass.name()} ({ModelClass.__name__})')
             test_ds = DatasetClass(split='test', downsample_frac=frac, genre_encoder=train_ds.genre_encoder)

@@ -17,8 +17,8 @@ class MelCNNFMAModel(AbstractFMAGenreModule):
 			return mel_collate
 			
 		@classmethod
-		def train_generic(cls, train_dataset: VariableFMADataset, val_dataset: VariableFMADataset):
-				model = cls(train_dataset.num_classes)
+		def train_generic(cls, train_dataset: VariableFMADataset, val_dataset: VariableFMADataset, tag: str):
+				model = cls(train_dataset.num_classes, tag=tag)
 				model.fma_train(train_dataset, val_dataset, batch_size=16, num_epochs=100)
 
 		@classmethod

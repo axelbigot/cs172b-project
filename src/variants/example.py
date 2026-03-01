@@ -11,8 +11,8 @@ from src.constants import *
 
 class ExampleFMAModel(AbstractFMAGenreModule):
 	@classmethod
-	def train_generic(cls, train_dataset, val_dataset):
-		model = ExampleFMAModel(train_dataset.num_classes)
+	def train_generic(cls, train_dataset, val_dataset, tag):
+		model = ExampleFMAModel(train_dataset.num_classes, tag=tag)
 		model.fma_train(train_dataset, val_dataset, batch_size=4, num_epochs=100)
 
 	@classmethod

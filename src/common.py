@@ -26,7 +26,7 @@ def audio_genre_collate(batch: List[Tuple[callable, torch.LongTensor, int]]) -> 
 class AbstractFMAGenreModule(nn.Module, ABC):
 	@classmethod
 	@abstractmethod
-	def train_generic(cls, train_dataset: VariableFMADataset, val_dataset: VariableFMADataset):
+	def train_generic(cls, train_dataset: VariableFMADataset, val_dataset: VariableFMADataset, tag: str):
 		"""_summary_ Static method that each FMA model must implement which will be called by the main program.
 		This function should delegate to `fma_train`.
 
@@ -66,6 +66,9 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 	@classmethod
 	def collate_fn(cls):
 		return audio_genre_collate
+	
+	def __init__(self, tag: str):
+		self.tag = tag
 	
 	@abstractmethod
 	def forward(self, x: List[callable], ids: List[int]) -> torch.Tensor:
@@ -129,7 +132,7 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 		epoch = 0
 
-		path = DATA_DIRECTORY / f'model_trained_{self.name()}_{train_dataset.__class__.__name__}_frac-{train_dataset.dowsample_frac}'
+		path = DATA_DIRECTORY / f'model_trained_{self.name()}{f"_tag-{self.tag}" if len(self.tag) else ""}_{train_dataset.__class__.__name__}_frac-{train_dataset.dowsample_frac}'
 		log_dir = DATA_DIRECTORY / f'runs/{self.name()}'
 
 		log_dir.mkdir(parents=True, exist_ok=True)
