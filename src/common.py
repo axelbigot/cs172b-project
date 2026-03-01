@@ -137,8 +137,11 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 		epoch = 0
 
-		path = DATA_DIRECTORY / f'model_trained_{self.name()}{f"_tag-{self.tag}" if len(self.tag) else ""}_{train_dataset.__class__.__name__}_frac-{train_dataset.dowsample_frac}'
-		log_dir = DATA_DIRECTORY / f'runs/{self.name()}'
+		idstr = self.get_idstr(train_dataset)
+		visualizer = TrainingVisualizer(train_dataset, idstr)
+
+		path = DATA_DIRECTORY / idstr
+		log_dir = DATA_DIRECTORY / f'runs/{idstr}'
 
 		log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -174,10 +177,6 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 			shuffle=False,
 			collate_fn=self.collate_fn(),
 		)
-
-		idstr = self.get_idstr(train_dataset)
-		visualizer = TrainingVisualizer(train_dataset, idstr)
-		snapshot_interval = max(1, num_epochs // 10)
 
 		for ep in tqdm(range(epoch, num_epochs), desc='Total Epochs'):
 			epoch = ep
