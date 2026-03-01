@@ -9,6 +9,7 @@ import torch
 import logging
 import hashlib
 import os
+import librosa
 
 from torch.utils.data import Dataset
 from os import PathLike
@@ -25,6 +26,19 @@ from src.constants import *
 
 
 DATA_DIR = Path('data')
+
+class SegmentLoader:
+	def __init__(self, loader, path: str, start: int, end: int):
+		self.loader = loader
+		self.path = path
+		self.start = start
+		self.end = end
+
+	def __call__(self, device: str):
+		audio_bytes = self.loader.load(self.path)
+		audio = torch.tensor(audio_bytes, dtype=torch.float32)
+		audio = audio[self.start:self.end]
+		return audio.to(device)
 
 class VariableFMADataset(Dataset):
 	metadata_cache: dict[str, pd.DataFrame] = {}
@@ -171,20 +185,12 @@ class VariableFMADataset(Dataset):
 
 	def __getitem__(self, index: int) -> Tuple[callable, torch.LongTensor, int]:
 		record = self.index_[index]
-
 		path = record['path']
 		st = record['start']
 		end = record['end']
 		label = record["label"]
 
-		def load_segment(device: str):
-			audio_bytes = self.loader_.load(path)
-			audio = torch.tensor(audio_bytes, dtype=torch.float32)
-			audio = self.raw_subsample_(audio, st, end)
-
-			audio.to(device)
-			return audio
-		
+		load_segment = SegmentLoader(self.loader_, path, st, end)
 		return load_segment, torch.tensor(label, dtype=torch.long), index
 
 	

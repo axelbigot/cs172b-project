@@ -10,6 +10,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from os import PathLike
 from typing import List, Tuple
+from sklearn.metrics import confusion_matrix, f1_score
 
 from src.constants import *
 from src.fma import VariableFMADataset
@@ -61,6 +62,10 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 				_description_ Display name (ideally short). This value must be unique compared to other models.
 		"""
 		pass
+
+	@classmethod
+	def collate_fn(cls):
+		return audio_genre_collate
 	
 	@abstractmethod
 	def forward(self, x: List[callable], ids: List[int]) -> torch.Tensor:
@@ -79,7 +84,7 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 		pass
 
 	def transform_batch(self, dataset, x, ids):
-		return x, ids
+		return x
 
 	def fma_train(
 		self,
@@ -152,14 +157,14 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 			train_dataset,
 			batch_size=batch_size,
 			shuffle=True,
-			collate_fn=audio_genre_collate
+			collate_fn=self.collate_fn(),
 		)
 
 		val_loader = DataLoader(
 			val_dataset,
 			batch_size=batch_size,
 			shuffle=False,
-			collate_fn=audio_genre_collate
+			collate_fn=self.collate_fn(),
 		)
 
 		for ep in tqdm(range(epoch, num_epochs), desc='Total Epochs'):
@@ -187,13 +192,31 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 			train_accuracy = n_correct / total
 			train_loss /= total
 
-			val_loss, val_accuracy = self.evaluate(val_dataset, val_loader, device, criterion)
+			val_loss, val_accuracy, val_preds, val_labels = self.evaluate(
+				val_dataset,
+				val_loader,
+				device,
+				criterion,
+				return_preds=True
+			)
+
+			macro_f1 = f1_score(val_labels.numpy(), val_preds.numpy(), average='macro')
 
 			logging.info(
 				f'Epoch {epoch+1}\n'
 				f'\tTrain loss: {train_loss:6f}, accuracy: {(train_accuracy * 100):6f}%\n'
-				f'\tValidation loss: {val_loss:6f}, accuracy: {(val_accuracy * 100):6f}%'
+				f'\tValidation loss: {val_loss:6f}, accuracy: {(val_accuracy * 100):6f}%\n'
+				f"Validation Macro F1: {macro_f1:.4f}"
 			)
+
+			cm = confusion_matrix(val_labels.numpy(), val_preds.numpy())
+			print(f'\n{cm}')
+
+			per_class_acc = cm.diagonal() / cm.sum(axis=1)
+			for i, acc in enumerate(per_class_acc):
+					class_name = val_dataset.genre_encoder.inverse_transform([i])[0]
+					logging.info(f"Class {class_name}: {acc*100:.2f}%")
+					writer.add_scalar(f'PerClassAcc/{class_name}', acc, ep)
 
 			writer.add_scalar('Loss/Train', train_loss, ep)
 			writer.add_scalar('Accuracy/Train', train_accuracy, ep)
@@ -221,7 +244,7 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 			test_dataset,
 			shuffle=False,
 			batch_size=batch_size,
-			collate_fn=audio_genre_collate
+			collate_fn=self.collate_fn()
 		)
 		
 		self.to(device)
@@ -247,13 +270,17 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 		dataset: VariableFMADataset,
 		loader: DataLoader, 
 		device: str, 
-		criterion: nn.Module
-	) -> tuple[float, float]:
+		criterion: nn.Module,
+		return_preds: bool = False
+	):
 		self.eval()
 
 		total_loss = 0.0
 		n_correct = 0
 		total = 0
+
+		all_preds = []
+		all_labels = []
 
 		for batch in loader:
 			batch_X, batch_y, ids = self.batch_to_device_(batch, device)
@@ -263,11 +290,19 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 			total_loss += loss.item() * len(batch_y)
 
 			preds = outputs.argmax(dim=1)
+
 			n_correct += (preds == batch_y).sum().item()
 			total += len(batch_y)
 
+			if return_preds:
+				all_preds.append(preds.cpu())
+				all_labels.append(batch_y.cpu())
+
 		accuracy = n_correct / total
 		avg_loss = total_loss / total
+
+		if return_preds:
+			return avg_loss, accuracy, torch.cat(all_preds), torch.cat(all_labels)
 
 		return avg_loss, accuracy
 
