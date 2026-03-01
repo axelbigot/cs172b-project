@@ -1,6 +1,5 @@
-from src.variants.example import *
-
+from .vggish_model import VGGishFMA
 
 __all__ = [
-	'ExampleFMAModel'
+    "VGGishFMA"
 ]

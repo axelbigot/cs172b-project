@@ -14,6 +14,8 @@ from src.variants import *
 from src.constants import *
 
 
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run an FMA model')
     
