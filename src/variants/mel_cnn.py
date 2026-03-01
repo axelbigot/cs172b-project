@@ -1,102 +1,55 @@
-# src/models/mel_cnn_fma.py
+from typing import List, Tuple
 import torch
 import torch.nn as nn
-import numpy as np
-import librosa
+from src.fma import VariableFMADataset
+from src.common import AbstractFMAGenreModule
 
-from src.constants import *
-from src.fma import *
-from src.common import *
+
+def mel_collate(batch: List[Tuple[torch.Tensor, torch.LongTensor, int]]):
+		mels = torch.stack([x for x, _, _ in batch], dim=0)  # shape: (B, 1, n_mels, T)
+		labels = torch.stack([y for _, y, _ in batch], dim=0)
+		ids = [i for _, _, i in batch]
+		return mels, labels, ids
 
 class MelCNNFMAModel(AbstractFMAGenreModule):
-	@classmethod
-	def train_generic(cls, train_dataset, val_dataset):
-		model = cls()
-		model.fma_train(train_dataset, val_dataset, batch_size=8, num_epochs=5000)
+		@classmethod
+		def collate_fn(cls):
+			return mel_collate
+			
+		@classmethod
+		def train_generic(cls, train_dataset: VariableFMADataset, val_dataset: VariableFMADataset, tag: str):
+				model = cls(train_dataset.num_classes, tag=tag)
+				model.fma_train(train_dataset, val_dataset, batch_size=16, num_epochs=100)
 
-	@classmethod
-	def name(cls):
-		return 'mel-cnn'
+		@classmethod
+		def test_generic(cls, test_dataset: VariableFMADataset):
+				model = cls(test_dataset.num_classes)
+				acc = model.fma_test(test_dataset)
+				print(f'Test accuracy: {acc*100:.2f}%')
 
-	def __init__(
-		self,
-		sr: int = 22050,
-		n_mels: int = 128,
-		n_fft: int = 2048,
-		hop_length: int = 512,
-		conv_channels: tuple[int, ...] = (16, 32, 64),
-		**kwargs
-	):
-		super().__init__(**kwargs)
-		self.sr = sr
-		self.n_mels = n_mels
-		self.n_fft = n_fft
-		self.hop_length = hop_length
+		@classmethod
+		def name(cls):
+				return 'mel-cnn'
 
-		channels = conv_channels
-		layers = []
-		in_ch = 1
-		for out_ch in channels:
-			layers.append(nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False))
-			layers.append(nn.BatchNorm2d(out_ch))
-			layers.append(nn.ReLU(inplace=True))
-			layers.append(nn.MaxPool2d(kernel_size=(2, 2)))
-			in_ch = out_ch
+		def __init__(self, num_classes: int, conv_channels=(32,64,128), **kwargs):
+				super().__init__(**kwargs)
+				layers = []
+				in_ch = 1
+				for out_ch in conv_channels:
+						layers.append(nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1))
+						layers.append(nn.BatchNorm2d(out_ch))
+						layers.append(nn.ReLU(inplace=True))
+						layers.append(nn.MaxPool2d((2,2)))
+						in_ch = out_ch
+				layers.append(nn.AdaptiveAvgPool2d((1,None)))
+				self.feature_extractor = nn.Sequential(*layers)
+				self.dropout = nn.Dropout(0.3)
+				self.classifier = nn.Linear(conv_channels[-1], num_classes)
 
-		layers.append(nn.AdaptiveAvgPool2d((1, 1)))
-
-		self.feature_extractor = nn.Sequential(*layers)
-		self.classifier = nn.Linear(channels[-1], NUM_CLASSES)
-
-		self.mel_cache_ = {}
-
-	def compute_mel(self, audio: np.ndarray, aid: int) -> np.ndarray:
-		if aid in self.mel_cache_:
-			return self.mel_cache_[aid]
-		
-		if audio.dtype != np.float32:
-			audio = audio.astype(np.float32)
-		S = librosa.feature.melspectrogram(
-			y=audio,
-			sr=self.sr,
-			n_fft=self.n_fft,
-			hop_length=self.hop_length,
-			n_mels=self.n_mels,
-			power=2.0
-		)
-		S_db = librosa.power_to_db(S, ref=np.max)
-		mean = float(np.mean(S_db))
-		std = float(np.std(S_db))
-		if std < 1e-6:
-			std = 1.0
-		S_norm = (S_db - mean) / std
-
-		self.mel_cache_[aid] = S_norm
-		return S_norm
-
-	def forward(self, batch_X: List[torch.FloatTensor], ids: List[int]) -> torch.Tensor:
-		mel_list = []
-		for a, aid in zip(batch_X, ids):
-			arr = a.detach().cpu().numpy().astype(np.float32)
-			if arr.ndim > 1:
-				arr = np.mean(arr, axis=0)
-			mel = self.compute_mel(arr, aid)
-			tensor = torch.from_numpy(mel).unsqueeze(0)
-			mel_list.append(tensor)
-
-		max_t = max(m.shape[2] for m in mel_list)
-		padded = []
-		for m in mel_list:
-			t = m.shape[2]
-			if t < max_t:
-				padding = torch.zeros((1, self.n_mels, max_t - t), dtype=m.dtype)
-				m = torch.cat([m, padding], dim=2)
-			padded.append(m)
-
-		device = next(self.parameters()).device
-		x = torch.stack(padded, dim=0).to(device)
-
-		feat = self.feature_extractor(x)
-		feat = feat.view(feat.size(0), -1)
-		logits = self.classifier(feat)
-		return logits
+		def forward(self, batch_X: torch.Tensor, ids: List[int] = None) -> torch.Tensor:
+				device = next(self.parameters()).device
+				x = batch_X.to(device)
+				feat = self.feature_extractor(x)
+				feat = feat.mean(dim=3).squeeze(2)
+				feat = self.dropout(feat)
+				return self.classifier(feat)
