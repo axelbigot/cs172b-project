@@ -10,7 +10,7 @@ from src.common import *
 class MFCC_CNNFMAModel(AbstractFMAGenreModule):
     @classmethod
     def train_generic(cls, train_dataset, val_dataset):
-        model = cls().fma_train(train_dataset, val_dataset, batch_size = 16, num_epochs = 750)
+        model = cls().fma_train(train_dataset, val_dataset, batch_size = 16, num_epochs = 1500)
     
     @classmethod
     def name(cls):
