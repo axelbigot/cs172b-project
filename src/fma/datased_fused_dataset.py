@@ -38,7 +38,8 @@ class DatasedFusedDataset(VariableFMADataset):
 		files = self.get_datased_files_(datased_wav_dir)
 
 		train_files, val_files, test_files = self.assign_dataset_split_(files)
-		count_per_genre = len(self.audio_cache_) / len(self.track_genres.unique())
+		fma_samples = len(self.audio_cache_)
+		count_per_genre = fma_samples / len(self.track_genres.unique())
 		target_count = int(count_per_genre * noise_count_factor)
 
 		if self.split == 'training':
@@ -59,10 +60,10 @@ class DatasedFusedDataset(VariableFMADataset):
 			logging.info(f'[DATASET] Noise files retrieved from cache {cache_out_}')
 			cache_dict = torch.load(cache_out_)
 
-			self.audio_cache_ = cache_dict['audio_cache']
-			self.track_ids_ = cache_dict['track_ids']
-			self.audio_start_pos_ = cache_dict['start_pos']
-			self.audio_end_pos_ = cache_dict['end_pos']
+			self.audio_cache_.extend(cache_dict['audio_cache'])
+			self.track_ids_.extend(cache_dict['track_ids'])
+			self.audio_start_pos_.extend(cache_dict['start_pos'])
+			self.audio_end_pos_.extend(cache_dict['end_pos'])
 		else:
 			segments = self.generate_segments_for_split_(files, target_count)
 
@@ -73,10 +74,10 @@ class DatasedFusedDataset(VariableFMADataset):
 
 			logging.info(f'[DATASET] Saving noise to cache {cache_out_}')
 			torch.save({
-				'audio_cache': self.audio_cache_,
-				'track_ids': self.track_ids_,
-				'start_pos': self.audio_start_pos_,
-				'end_pos': self.audio_end_pos_,
+				'audio_cache': self.audio_cache_[fma_samples:],
+				'track_ids': self.track_ids_[fma_samples:],
+				'start_pos': self.audio_start_pos_[fma_samples:],
+				'end_pos': self.audio_end_pos_[fma_samples:],
 			}, cache_out_)
 		
 		self.track_genres = torch.tensor([g for _, g in self.audio_cache_], dtype=torch.long)

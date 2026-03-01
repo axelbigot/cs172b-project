@@ -11,12 +11,12 @@ from src.common import *
 class MelCNNFMAModel(AbstractFMAGenreModule):
 	@classmethod
 	def train_generic(cls, train_dataset, val_dataset):
-		model = cls()
+		model = cls(train_dataset.num_classes)
 		model.fma_train(train_dataset, val_dataset, batch_size=8, num_epochs=1000)
 
 	@classmethod
 	def test_generic(cls, test_dataset):
-		model = cls()
+		model = cls(test_dataset.num_classes)
 		test_accuracy = model.fma_test(test_dataset)
 
 		logging.info(f'Test accuracy: {(test_accuracy * 100):6f}%')
@@ -27,6 +27,7 @@ class MelCNNFMAModel(AbstractFMAGenreModule):
 
 	def __init__(
 		self,
+		num_classes: int,
 		sr: int = 22050,
 		n_mels: int = 128,
 		n_fft: int = 2048,
@@ -53,7 +54,7 @@ class MelCNNFMAModel(AbstractFMAGenreModule):
 		layers.append(nn.AdaptiveAvgPool2d((1, 1)))
 
 		self.feature_extractor = nn.Sequential(*layers)
-		self.classifier = nn.Linear(channels[-1], 8)
+		self.classifier = nn.Linear(channels[-1], num_classes)
 
 		self.mel_cache_ = {}
 
