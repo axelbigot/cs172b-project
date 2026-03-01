@@ -15,12 +15,12 @@ from src.constants import *
 from src.fma import VariableFMADataset
 
 
-def audio_genre_collate(batch: List[Tuple[torch.FloatTensor, torch.LongTensor, int]]) -> Tuple[List[torch.FloatTensor], torch.LongTensor, List[int]]:
-	audios = [audio for audio, _, _ in batch]
+def audio_genre_collate(batch: List[Tuple[callable, torch.LongTensor, int]]) -> Tuple[List[callable], torch.LongTensor, List[int]]:
+	load_audios = [load_audio for load_audio, _, _ in batch]
 	labels = torch.stack([genre for _, genre, _ in batch])
 	ids = [i for _, _, i in batch]
 
-	return audios, labels, ids
+	return load_audios, labels, ids
 
 class AbstractFMAGenreModule(nn.Module, ABC):
 	@classmethod
@@ -63,13 +63,13 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 		pass
 	
 	@abstractmethod
-	def forward(self, x: List[torch.Tensor], ids: List[int]) -> torch.Tensor:
+	def forward(self, x: List[callable], ids: List[int]) -> torch.Tensor:
 		"""_summary_ Forward method of the model.
 
 		Parameters
 		----------
-		x : List[torch.Tensor]
-				_description_ Batched audio byte tensors (variable length).
+		x : List[callable]
+				_description_ returns batched audio byte tensors (variable length).
 
 		Returns
 		-------
@@ -77,6 +77,9 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 				_description_ Logits tensor.
 		"""
 		pass
+
+	def transform_batch(self, dataset, x, ids):
+		return x, ids
 
 	def fma_train(
 		self,
@@ -171,7 +174,7 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 				batch_X, batch_y, ids = self.batch_to_device_(batch, device)
 
 				optimizer.zero_grad()
-				outputs = self(batch_X, ids)
+				outputs = self(self.transform_batch(train_dataset, batch_X, ids), ids)
 				loss = criterion(outputs, batch_y)
 				loss.backward()
 				optimizer.step()
@@ -184,7 +187,7 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 			train_accuracy = n_correct / total
 			train_loss /= total
 
-			val_loss, val_accuracy = self.evaluate(val_loader, device, criterion)
+			val_loss, val_accuracy = self.evaluate(val_dataset, val_loader, device, criterion)
 
 			logging.info(
 				f'Epoch {epoch+1}\n'
@@ -230,7 +233,7 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 		for batch in tqdm(test_loader, desc=f'Testing in progress'):
 			batch_X, batch_y, ids = self.batch_to_device_(batch, device)
 
-			logits = self(batch_X, ids)
+			logits = self(self.transform_batch(test_dataset, batch_X, ids), ids)
 			preds = logits.argmax(dim=1)
 
 			correct += (preds == batch_y).sum().item()
@@ -241,6 +244,7 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 	@torch.no_grad()
 	def evaluate(
 		self, 
+		dataset: VariableFMADataset,
 		loader: DataLoader, 
 		device: str, 
 		criterion: nn.Module
@@ -253,7 +257,7 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 		for batch in loader:
 			batch_X, batch_y, ids = self.batch_to_device_(batch, device)
-			outputs = self(batch_X, ids)
+			outputs = self(self.transform_batch(dataset, batch_X, ids), ids)
 
 			loss = criterion(outputs, batch_y)
 			total_loss += loss.item() * len(batch_y)
@@ -267,6 +271,5 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 		return avg_loss, accuracy
 
-	def batch_to_device_(self, batch: Tuple[List[torch.FloatTensor], torch.LongTensor, List[int]], device: str) -> Tuple[List[torch.FloatTensor], torch.LongTensor, List[int]]:
-		audios = [x.to(device) for x in batch[0]]
-		return (audios, batch[1].to(device), batch[2])
+	def batch_to_device_(self, batch: Tuple[List[torch.FloatTensor], torch.LongTensor, List[int]], device: str) -> Tuple[List[callable], torch.LongTensor, List[int]]:
+		return (batch[0], batch[1].to(device), batch[2])

@@ -13,9 +13,8 @@ class DatasetAnalyzer:
 	def __init__(self, 
 		name: str,
 		idstr: str,
-		sampling_rate: int,
-		audio_tensors: List[torch.FloatTensor], 
-		track_genres: List[torch.LongTensor],
+		sampling_rate: int, 
+		track_genres: List[int],
 		genre_encoder: LabelEncoder,
 		audio_min_sec: int,
 		audio_max_sec: int,
@@ -24,7 +23,6 @@ class DatasetAnalyzer:
 	):
 		self.ds_name_ = name
 		self.sampling_rate_ = sampling_rate
-		self.audio_tensors = audio_tensors
 		self.track_genres = track_genres
 		self.genre_encoder = genre_encoder
 		self.audio_min_sec = audio_min_sec
@@ -37,7 +35,7 @@ class DatasetAnalyzer:
 		if self.dir_.exists():
 			shutil.rmtree(self.dir_)
 		self.dir_.mkdir(parents=True, exist_ok=True)
-		self.lengths_sec = [len(t)/self.sampling_rate_ for t in self.audio_tensors]
+		self.lengths_sec = [(end-st)/self.sampling_rate_ for st, end in zip(self.audio_start_pos, self.audio_end_pos)]
 		self.start_sec = [st/self.sampling_rate_ for st in self.audio_start_pos]
 		self.mean_length_sec = sum(self.lengths_sec)/len(self.lengths_sec) if self.lengths_sec else 0.0
 		self.genre_names = self.genre_encoder.classes_
@@ -62,7 +60,7 @@ class DatasetAnalyzer:
 		print(
 			f'Dataset: {self.ds_name_}'
 			f'\nSampling rate: {self.sampling_rate_}'
-			f'\nTotal audio files: {len(self.audio_tensors)}'
+			f'\nTotal audio files: {len(self.audio_start_pos)}'
 			f'\nMean audio length: {self.mean_length_sec:.2f}s'
 		)
 		print("Counts per genre:")
@@ -70,7 +68,7 @@ class DatasetAnalyzer:
 			print(f"{g}: count={stat['count']}, mean_length={stat['mean_length']:.2f}s, mean_start={stat['mean_start']:.2f}s, std_length={stat['std_length']:.2f}, std_start={stat['std_start']:.2f}")
 
 	def visual(self):
-		if not self.audio_tensors:
+		if not self.audio_start_pos:
 			logging.warning("[ANALYSIS] No data to visualize.")
 			return
 		plt.style.use("ggplot")
@@ -89,12 +87,14 @@ class DatasetAnalyzer:
 		plt.tight_layout()
 		plt.savefig(self.dir_/ f"{self.ds_name_}_counts_by_genre.png", dpi=200)
 		plt.close(fig)
-		global_bins = range(self.audio_min_sec, self.audio_max_sec+1)
+		global_bins = range(self.audio_min_sec, self.audio_max_sec + 1)
+		start_max = max(int(np.ceil(max(self.start_sec))) if self.start_sec else self.audio_max_sec, 1)
+		start_bins = range(0, start_max + 1)
 		self._plot_hist(self.lengths_sec, global_bins, "Audio Length (seconds)", "Frequency", f"{self.ds_name_}_length_histogram.png", f"{self.ds_name_} — Audio Length Histogram")
-		self._plot_hist(self.start_sec, global_bins, "Start Position (seconds)", "Frequency", f"{self.ds_name_}_start_histogram.png", f"{self.ds_name_} — Start Position Histogram")
+		self._plot_hist(self.start_sec, start_bins, "Start Position (seconds)", "Frequency", f"{self.ds_name_}_start_histogram.png", f"{self.ds_name_} — Start Position Histogram")
 		for g, stat in self.per_genre_stats.items():
 			self._plot_hist(stat['lengths_sec'], global_bins, "Audio Length (seconds)", "Frequency", f"{g}_length_histogram.png", f"{self.ds_name_} — {g} Length Histogram")
-			self._plot_hist(stat['start_sec'], global_bins, "Start Position (seconds)", "Frequency", f"{g}_start_histogram.png", f"{self.ds_name_} — {g} Start Histogram")
+			self._plot_hist(stat['start_sec'], start_bins, "Start Position (seconds)", "Frequency", f"{g}_start_histogram.png", f"{self.ds_name_} — {g} Start Histogram")
 		self._plot_bar_mean_std('length')
 		self._plot_bar_mean_std('start')
 		logging.info(f"[ANALYSIS] Saved visualizations to {self.dir_}")
@@ -164,7 +164,7 @@ def compare_splits(*analyzers: DatasetAnalyzer):
 	genre_names = analyzers[0].genre_encoder.classes_
 	genre_percentages = []
 	for a in analyzers:
-		counts = [torch.sum(a.track_genres == i).item() for i in range(len(genre_names))]
+		counts = [sum(1 for x in a.track_genres if x == i) for i in range(len(genre_names))]
 		total = sum(counts)
 		if total > 0:
 			percent = [c/total*100 for c in counts]

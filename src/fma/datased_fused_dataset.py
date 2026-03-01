@@ -38,8 +38,8 @@ class DatasedFusedDataset(VariableFMADataset):
 		files = self.get_datased_files_(datased_wav_dir)
 
 		train_files, val_files, test_files = self.assign_dataset_split_(files)
-		fma_samples = len(self.audio_cache_)
-		count_per_genre = fma_samples / len(self.track_genres.unique())
+		self.fma_samples = len(self.index_)
+		count_per_genre = self.fma_samples / (self.num_classes - 1)
 		target_count = int(count_per_genre * noise_count_factor)
 
 		if self.split == 'training':
@@ -56,47 +56,40 @@ class DatasedFusedDataset(VariableFMADataset):
 		
 		self.nonmusic_label = int(self.genre_encoder.transform([NON_MUSIC_CLASS])[0])
 
+		self.noise_index_: List[dict] = []
 		if cache_out_.exists():
 			logging.info(f'[DATASET] Noise files retrieved from cache {cache_out_}')
-			cache_dict = torch.load(cache_out_)
-
-			self.audio_cache_.extend(cache_dict['audio_cache'])
-			self.track_ids_.extend(cache_dict['track_ids'])
-			self.audio_start_pos_.extend(cache_dict['start_pos'])
-			self.audio_end_pos_.extend(cache_dict['end_pos'])
+			self.noise_index_ = torch.load(cache_out_)
 		else:
 			segments = self.generate_segments_for_split_(files, target_count)
 
-			for st, end, tid in segments:
-				self.track_ids_.append(tid)
-				self.audio_start_pos_.append(st)
-				self.audio_end_pos_.append(end)
+			for path, st, end, tid in segments:
+				self.noise_index_.append({
+					'track_id': tid,
+					'path': path,
+					'start': st,
+					'end': end,
+					'label': int(self.nonmusic_label)
+				})
 
 			logging.info(f'[DATASET] Saving noise to cache {cache_out_}')
-			torch.save({
-				'audio_cache': self.audio_cache_[fma_samples:],
-				'track_ids': self.track_ids_[fma_samples:],
-				'start_pos': self.audio_start_pos_[fma_samples:],
-				'end_pos': self.audio_end_pos_[fma_samples:],
-			}, cache_out_)
+			torch.save(self.noise_index_, cache_out_)
 		
-		self.track_genres = torch.tensor([g for _, g in self.audio_cache_], dtype=torch.long)
+		self.index_.extend(self.noise_index_)
 
 	def create_encoder(self, current_encoder):
 		classes = list(current_encoder.classes_)
 		if NON_MUSIC_CLASS not in classes:
 			classes = sorted(classes + [NON_MUSIC_CLASS])
-			current_encoder = genre_encoder = LabelEncoder()
-			current_encoder = genre_encoder.fit(classes)
+			current_encoder = LabelEncoder()
+			current_encoder = current_encoder.fit(classes)
 
 		return current_encoder
 
 	def generate_segments_for_split_(self, files: List[Tuple[Path,float]], target_count: int) -> List[Tuple[int,int,int]]:
-		segments: List[Tuple[int,int,int]] = []
+		segments: List[Tuple[str, int, int, int]] = []
 		if target_count <= 0:
 			return segments
-
-		base_index = int(max(self.track_ids_) + 1)
 
 		logging.info(f'[DATASET] Subsampling initial noise files (first pass)')
 		for path, dur in tqdm(files, total=target_count, desc='Subsampling'):
@@ -105,10 +98,9 @@ class DatasedFusedDataset(VariableFMADataset):
 			fp = str(path)
 			
 			audio_tensor = self.load_audio_(fp)
-			track_id = base_index + len(segments)
-			crop, st, end = self.subsample_audio_(self.compute_seed_(track_id), audio_tensor)
-			segments.append((st, end, track_id))
-			self.audio_cache_.append((crop, torch.tensor(self.nonmusic_label, dtype=torch.long)))
+			track_id = self.fma_samples + len(segments)
+			_, st, end = self.subsample_audio_(self.compute_seed_(track_id), audio_tensor)
+			segments.append((str(path), st, end, track_id))
 
 		min_split_len = max(40, int(self.audio_max_sec_ * 1.5))
 		candidates = [f for f in files if f[1] >= min_split_len]
@@ -128,10 +120,9 @@ class DatasedFusedDataset(VariableFMADataset):
 					fp = str(path)
 
 					audio_tensor = self.load_audio_(fp)
-					track_id = base_index + len(segments)
-					crop, st, end = self.subsample_audio_(self.compute_seed_(track_id), audio_tensor)
-					segments.append((st, end, track_id))
-					self.audio_cache_.append((crop, torch.tensor(self.nonmusic_label, dtype=torch.long)))
+					track_id = self.fma_samples + len(segments)
+					_, st, end = self.subsample_audio_(self.compute_seed_(track_id), audio_tensor)
+					segments.append((str(path), st, end, track_id))
 					made_progress = True
 				if made_progress:
 					pbar.n = len(segments)

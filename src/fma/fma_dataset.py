@@ -66,7 +66,7 @@ class VariableFMADataset(Dataset):
 
 		self.idstr_ = f'split-{split}_seed-{RANDOM_SEED}_min-{self.audio_min_sec_}_max-{self.audio_max_sec_}_sr-{self.sampling_rate_}_frac-{downsample_frac}'
 
-		cache_out_ = Path(DATA_DIR / f'VariableFMADataset-audio-cache-{self.idstr_}.pt')
+		cache_out_ = Path(DATA_DIR / f'VariableFMADataset-index-{self.idstr_}.pt')
 
 		fma_metadata_zip = Path(fma_metadata_zip)
 		fma_small_zip = Path(fma_small_zip)
@@ -134,70 +134,78 @@ class VariableFMADataset(Dataset):
 			self.genre_encoder = genre_encoder
 
 		pd_tracks['genre_encoded'] = self.genre_encoder.transform(pd_tracks[('track', 'genre_top')])
-		self.track_genres = torch.tensor(pd_tracks['genre_encoded'].values, dtype=torch.long)
+		track_genres = torch.tensor(pd_tracks['genre_encoded'].values, dtype=torch.long)
+
+		self.index_: List[dict] = []
 
 		self.loader_ = fma_utils.LibrosaLoader(sampling_rate=sampling_rate)
 
-		self.track_ids_ = []
-		self.audio_start_pos_ = []
-		self.audio_end_pos_ = []
-
-		logging.info(f'[DATASET] Preloading {len(pd_tracks)} audio files into memory')
+		logging.info(f'[DATASET] Building metadata index ({len(pd_tracks)} tracks)')
 		if cache_out_.exists():
-			logging.info(f'[DATASET] Audio files retrieved from cache {cache_out_}')
-			cache_dict = torch.load(cache_out_)
-
-			self.audio_cache_ = cache_dict['audio_cache']
-			self.track_ids_ = cache_dict['track_ids']
-			self.audio_start_pos_ = cache_dict['start_pos']
-			self.audio_end_pos_ = cache_dict['end_pos']
+			logging.info(f'[DATASET] Metadata retrieved from cache {cache_out_}')
+			self.index_ = torch.load(cache_out_)
 		else:
-			self.audio_cache_: List[Tuple[torch.FloatTensor, torch.LongTensor]] = []
-			for tid, genre in tqdm(zip(pd_tracks.index, self.track_genres), total=len(pd_tracks), desc='Preloading'):
+			for tid, genre in tqdm(
+				zip(pd_tracks.index, track_genres),
+				total=len(pd_tracks),
+				desc='Indexing'
+			):
 				result = self.subsample_audio_fma_(tid)
 				if result is None:
 					continue
-				
-				crop, st, end = result
 
-				self.audio_cache_.append((crop, genre))
-				self.track_ids_.append(tid)
-				self.audio_start_pos_.append(st)
-				self.audio_end_pos_.append(end)
+				_, st, end = result  # discard waveform
 
-			logging.info(f'Saving preloaded audio files to cache {cache_out_}')
-			torch.save({
-				"audio_cache": self.audio_cache_,
-				"track_ids": self.track_ids_,
-				"start_pos": self.audio_start_pos_,
-				"end_pos": self.audio_end_pos_,
-			}, cache_out_)
+				path = fma_utils.get_audio_path(self.fma_small_out_, tid)
 
-		self.track_genres = torch.tensor([g for _, g in self.audio_cache_], dtype=torch.long)
+				self.index_.append({
+					"track_id": len(self.index_),
+					"path": str(path),
+					"start": int(st),
+					"end": int(end),
+					"label": int(genre),
+				})
 
-	def __getitem__(self, index: int) -> Tuple[torch.FloatTensor, torch.LongTensor, int]:
-		audio, genre = self.audio_cache_[index]
-		return audio, genre, index
+			logging.info(f'[DATASET] Saving metadata index to cache {cache_out_}')
+			torch.save(self.index_, cache_out_)
+
+	def __getitem__(self, index: int) -> Tuple[callable, torch.LongTensor, int]:
+		record = self.index_[index]
+
+		path = record['path']
+		st = record['start']
+		end = record['end']
+		label = record["label"]
+
+		def load_segment(device: str):
+			audio_bytes = self.loader_.load(path)
+			audio = torch.tensor(audio_bytes, dtype=torch.float32)
+			audio = self.raw_subsample_(audio, st, end)
+
+			audio.to(device)
+			return audio
+		
+		return load_segment, torch.tensor(label, dtype=torch.long), index
+
 	
 	def __len__(self):
-		return len(self.audio_cache_)
+		return len(self.index_)
 	
 	def analyzer(self) -> DatasetAnalyzer:
 		return DatasetAnalyzer(
 			name=f'{self.__class__.__name__}',
 			idstr=f'{self.__class__.__name__}_{self.idstr_}',
 			sampling_rate=self.sampling_rate_,
-			audio_tensors=[a for a, _ in self.audio_cache_],
-			track_genres=self.track_genres,
+			track_genres=[t['label'] for t in self.index_],
 			genre_encoder=self.genre_encoder,
 			audio_min_sec=self.audio_min_sec_,
 			audio_max_sec=self.audio_max_sec_,
-			audio_start_pos=self.audio_start_pos_,
-			audio_end_pos=self.audio_end_pos_,
+			audio_start_pos=[t['start'] for t in self.index_],
+			audio_end_pos=[t['end'] for t in self.index_],
 		)
 	
 	def create_encoder(self, current_encoder: LabelEncoder) -> LabelEncoder:
-		return self.genre_encoder
+		return current_encoder
 	
 	def subsample_audio_(self, seed: int, audio_tensor: torch.FloatTensor) -> Tuple[torch.FloatTensor, int, int]:
 		rng = np.random.RandomState(seed)
@@ -206,7 +214,6 @@ class VariableFMADataset(Dataset):
 		if len(audio_tensor) >= seg_len:
 			st = rng.randint(0, len(audio_tensor) - seg_len + 1)
 			end = st + seg_len
-			crop = audio_tensor[st:end]
 		else:
 			# logging.warning(
 			# 		f'[DATASET] Audio bytes too short ({len(audio_tensor) / self.sampling_rate_})'
@@ -214,9 +221,11 @@ class VariableFMADataset(Dataset):
 			# )
 			st = 0
 			end = len(audio_tensor)
-			crop = audio_tensor
 
-		return crop, st, end
+		return self.raw_subsample_(audio_tensor, st, end), st, end
+	
+	def raw_subsample_(self, audio_tensor: torch.FloatTensor, st: int, end: int) -> torch.FloatTensor:
+		return audio_tensor[st:end]
 
 	def subsample_audio_fma_(self, tid) -> Tuple[torch.FloatTensor, int, int] | None:
 		seed = self.compute_seed_(tid)

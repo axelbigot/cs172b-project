@@ -9,7 +9,7 @@ import argparse
 from torch.utils.data import DataLoader, random_split
 
 from src.common import AbstractFMAGenreModule
-from src.fma import VariableFMADataset, NoiseVariableFMADataset, compare_splits, DatasedFusedDataset
+from src.fma import VariableFMADataset, compare_splits, DatasedFusedDataset
 from src.variants import *
 from src.constants import *
 
