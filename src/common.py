@@ -5,7 +5,7 @@ import numpy as np
 
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from os import PathLike
@@ -25,32 +25,29 @@ def audio_genre_collate(batch: List[Tuple[torch.FloatTensor, torch.LongTensor, i
 class AbstractFMAGenreModule(nn.Module, ABC):
 	@classmethod
 	@abstractmethod
-	def train_generic(cls, train_dataset: Subset, val_dataset: Subset):
+	def train_generic(cls, train_dataset: VariableFMADataset, val_dataset: VariableFMADataset):
 		"""_summary_ Static method that each FMA model must implement which will be called by the main program.
 		This function should delegate to `fma_train`.
 
 		Parameters
 		----------
-		train_dataset : Subset
+		train_dataset : VariableFMADataset
 				_description_ Training dataset (train split)
-		val_dataset : Subset
+		val_dataset : VariableFMADataset
 				_description_ Validation dataset (validation split)
 		"""
 		pass
 
 	@classmethod
-	def test_generic(cls: type['AbstractFMAGenreModule'], test_dataset: Subset):
+	@abstractmethod
+	def test_generic(cls: type['AbstractFMAGenreModule'], test_dataset: VariableFMADataset):
 		"""_summary_ Static method that delegates to the unified testing loop.
 
 		Parameters
 		----------
-		test_dataset : Subset
+		test_dataset : VariableFMADataset
 				_description_ Test dataset (test split of data).
 		"""
-		model = cls()
-		test_accuracy = model.fma_test(test_dataset)
-
-		logging.info(f'Test accuracy: {(test_accuracy * 100):6f}%')
 
 	@classmethod
 	@abstractmethod
@@ -83,8 +80,8 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 	def fma_train(
 		self,
-		train_dataset: Subset,
-		val_dataset: Subset,
+		train_dataset: VariableFMADataset,
+		val_dataset: VariableFMADataset,
 		batch_size: int=16,
 		optimizer: torch.optim.Optimizer | None = None,
 		criterion: torch.nn.Module | None = None,
@@ -97,9 +94,9 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 		Parameters
 		----------
-		train_dataset : Subset
+		train_dataset : VariableFMADataset
 				_description_, Training dataset (train split)
-		val_dataset : Subset
+		val_dataset : VariableFMADataset
 				_description_, Validation dataset (validation split)
 		batch_size : int, optional
 				_description_, by default 16
@@ -208,7 +205,7 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 	def fma_test(
 		self, 
-		test_dataset: Subset, 
+		test_dataset: VariableFMADataset, 
 		batch_size=16,
 		device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 	) -> float:

@@ -29,6 +29,10 @@ DATA_DIR = Path('data')
 class VariableFMADataset(Dataset):
 	metadata_cache: dict[str, pd.DataFrame] = {}
 
+	@property
+	def num_classes(self):
+		return len(self.genre_encoder.classes_)
+
 	def __init__(self,
 		fma_metadata_zip: PathLike = 'fma_metadata.zip',
 		fma_small_zip: PathLike = 'fma_small.zip',
@@ -52,6 +56,8 @@ class VariableFMADataset(Dataset):
 		self.fma_metadata_out_ = Path(fma_metadata_out) / 'fma_metadata'
 		self.fma_small_out_ = Path(fma_small_out) / 'fma_small'
 
+		self.split = split
+
 		splits = ['training', 'validation', 'test']
 		if split not in splits:
 			raise RuntimeError(f'Unknown split {split}. Supported values are: {splits}')
@@ -65,18 +71,8 @@ class VariableFMADataset(Dataset):
 		fma_metadata_zip = Path(fma_metadata_zip)
 		fma_small_zip = Path(fma_small_zip)
 
-		def extract_zip(zip: Path, out: Path, check: Path):
-			logging.info(f'[DATASET] Extracting from {zip} to {out}')
-			if check.exists():
-				logging.info(f'[DATASET] output dir {check} already exists. {zip} assumed extracted, skipping ...')
-			else:
-				out.mkdir(parents=True, exist_ok=True)
-
-				with ZipFile(zip, 'r') as z:
-					z.extractall(out)
-
-		extract_zip(fma_metadata_zip, fma_metadata_out, self.fma_metadata_out_)
-		extract_zip(fma_small_zip, fma_small_out, self.fma_small_out_)
+		self.extract_zip_(fma_metadata_zip, fma_metadata_out, self.fma_metadata_out_)
+		self.extract_zip_(fma_small_zip, fma_small_out, self.fma_small_out_)
 
 		def load_metata_csv(csv_name: str) -> pd.DataFrame:
 			path = self.fma_metadata_out_ / csv_name
@@ -131,6 +127,7 @@ class VariableFMADataset(Dataset):
 		if split == 'training':
 			self.genre_encoder = LabelEncoder()
 			self.genre_encoder.fit(pd_tracks[('track', 'genre_top')])
+			self.genre_encoder = self.create_encoder(self.genre_encoder)
 		else:
 			if genre_encoder is None:
 				raise RuntimeError(f'For non train split, genre_encoder must be provided with the encoder from the train split')
@@ -157,7 +154,7 @@ class VariableFMADataset(Dataset):
 		else:
 			self.audio_cache_: List[Tuple[torch.FloatTensor, torch.LongTensor]] = []
 			for tid, genre in tqdm(zip(pd_tracks.index, self.track_genres), total=len(pd_tracks), desc='Preloading'):
-				result = self.subsample_audio_(tid)
+				result = self.subsample_audio_fma_(tid)
 				if result is None:
 					continue
 				
@@ -198,10 +195,31 @@ class VariableFMADataset(Dataset):
 			audio_start_pos=self.audio_start_pos_,
 			audio_end_pos=self.audio_end_pos_,
 		)
-
-	def subsample_audio_(self, tid) -> Tuple[torch.FloatTensor, int, int] | None:
-		seed = self.compute_seed_(tid)
+	
+	def create_encoder(self, current_encoder: LabelEncoder) -> LabelEncoder:
+		return self.genre_encoder
+	
+	def subsample_audio_(self, seed: int, audio_tensor: torch.FloatTensor) -> Tuple[torch.FloatTensor, int, int]:
 		rng = np.random.RandomState(seed)
+
+		seg_len = int(rng.uniform(self.audio_min_sec_, self.audio_max_sec_) * self.sampling_rate_)
+		if len(audio_tensor) >= seg_len:
+			st = rng.randint(0, len(audio_tensor) - seg_len + 1)
+			end = st + seg_len
+			crop = audio_tensor[st:end]
+		else:
+			# logging.warning(
+			# 		f'[DATASET] Audio bytes too short ({len(audio_tensor) / self.sampling_rate_})'
+			# 		f'for requested segment length ({seg_len / self.sampling_rate_}). Using entire audio as fallback'
+			# )
+			st = 0
+			end = len(audio_tensor)
+			crop = audio_tensor
+
+		return crop, st, end
+
+	def subsample_audio_fma_(self, tid) -> Tuple[torch.FloatTensor, int, int] | None:
+		seed = self.compute_seed_(tid)
 
 		path = fma_utils.get_audio_path(self.fma_small_out_, tid)
 		try:
@@ -211,24 +229,20 @@ class VariableFMADataset(Dataset):
 			logging.warning(f'[DATASET] Skipping audio file {path} (tid: {tid}) due to error: {e}')
 			return None
 
-		seg_len = int(rng.uniform(self.audio_min_sec_, self.audio_max_sec_) * self.sampling_rate_)
-		if len(audio_tensor) >= seg_len:
-			st = rng.randint(0, len(audio_tensor) - seg_len + 1)
-			end = st + seg_len
-			crop = audio_tensor[st:end]
-		else:
-			logging.warning(
-					f'Audio bytes too short ({len(audio_tensor)}) (tid: {tid}) '
-					f'for requested segment length ({seg_len}). Using entire audio as fallback'
-			)
-			st = 0
-			end = len(audio_tensor)
-			crop = audio_tensor
-
-		return crop, st, end
+		return self.subsample_audio_(seed, audio_tensor)
 
 	def compute_seed_(self, tid: int) -> int:
 		k = f'{self.random_seed_}_{tid}'.encode('utf8')
 		digest = hashlib.sha1(k).digest()
 		seed = int.from_bytes(digest[:4], 'big')
 		return seed
+	
+	def extract_zip_(self, zip: Path, out: Path, check: Path):
+		logging.info(f'[DATASET] Extracting from {zip} to {out}')
+		if check.exists():
+			logging.info(f'[DATASET] output dir {check} already exists. {zip} assumed extracted, skipping ...')
+		else:
+			out.mkdir(parents=True, exist_ok=True)
+
+			with ZipFile(zip, 'r') as z:
+				z.extractall(out)

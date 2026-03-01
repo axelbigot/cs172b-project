@@ -12,11 +12,18 @@ class MelCNNFMAModel(AbstractFMAGenreModule):
 	@classmethod
 	def train_generic(cls, train_dataset, val_dataset):
 		model = cls()
-		model.fma_train(train_dataset, val_dataset, batch_size=8, num_epochs=5000)
+		model.fma_train(train_dataset, val_dataset, batch_size=8, num_epochs=1000)
+
+	@classmethod
+	def test_generic(cls, test_dataset):
+		model = cls()
+		test_accuracy = model.fma_test(test_dataset)
+
+		logging.info(f'Test accuracy: {(test_accuracy * 100):6f}%')
 
 	@classmethod
 	def name(cls):
-		return 'mel-cnn-old'
+		return 'mel-cnn'
 
 	def __init__(
 		self,
