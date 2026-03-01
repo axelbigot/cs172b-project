@@ -10,13 +10,19 @@ from src.common import *
 class MFCC_CNNFMAModel(AbstractFMAGenreModule):
     @classmethod
     def train_generic(cls, train_dataset, val_dataset):
-        model = cls().fma_train(train_dataset, val_dataset, batch_size = 16, num_epochs = 750)
+        model = cls(train_dataset.num_classes).fma_train(train_dataset, val_dataset, batch_size = 16, num_epochs = 750)
+
+    @classmethod
+    def test_generic(cls, test_dataset: VariableFMADataset):
+        model = cls(test_dataset.num_classes)
+        acc = model.fma_test(test_dataset)
+        print(f'Test accuracy: {acc*100:.2f}%')
     
     @classmethod
     def name(cls):
         return 'mfcc-cnn'
 
-    def __init__(self, sample_rate: int = 22050, mfcc_coeffs: int = 40, fft_window: int = 2048, hop_length: int = 512, conv_channels: tuple[int, ...] = (16, 32, 64, 128), **kwargs):
+    def __init__(self, num_classes: int, sample_rate: int = 22050, mfcc_coeffs: int = 40, fft_window: int = 2048, hop_length: int = 512, conv_channels: tuple[int, ...] = (16, 32, 64, 128), **kwargs):
         super().__init__(**kwargs)
 
         self.sample_rate = sample_rate
@@ -26,7 +32,7 @@ class MFCC_CNNFMAModel(AbstractFMAGenreModule):
 
         # build CNN layers
         self.feature_extractor = self._build_cnn(conv_channels)
-        self.classifier = nn.Linear(conv_channels[-1], NUM_CLASSES)
+        self.classifier = nn.Linear(conv_channels[-1], num_classes)
 
         self.mfcc_cache = {}
     
@@ -66,11 +72,15 @@ class MFCC_CNNFMAModel(AbstractFMAGenreModule):
     def forward(self, batch_X: List[torch.Tensor], ids: List[int]) -> torch.Tensor:
         # convert batch to MFCCs and pad
         mfcc_tensors = []
-        for audio, aid in zip(batch_X, ids):
-            arr = audio.detach().cpu().numpy()
-            if arr.ndim > 1:
-                arr = arr.mean(axis = 0)
-            mfcc_arr = self._mfcc(arr, aid)
+        for audio_loader, aid in zip(batch_X, ids):
+            if aid in self.mfcc_cache:
+                mfcc_arr = self.mfcc_cache[aid]
+            else:
+                audio = audio_loader('cpu')
+                arr = audio.detach().cpu().numpy()
+                if arr.ndim > 1:
+                    arr = arr.mean(axis = 0)
+                mfcc_arr = self._mfcc(arr, aid)
             mfcc_tensors.append(torch.from_numpy(mfcc_arr)[None, :]) 
 
         # pad along time dimension
