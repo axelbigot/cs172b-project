@@ -6,9 +6,23 @@ from src.fma.mel_dataset import *
 from src.fma.mfcc_dataset import *
 
 
+class DatasedFusedDataset(DatasedFusedMixin, VariableFMADataset):
+	pass
+class MelFMADataset(MelPrecomputeMixin, VariableFMADataset):
+	pass
+class MelNoiseDataset(MelPrecomputeMixin, DatasedFusedDataset):
+	pass
+class MfccFMADataset(MfccPrecomputeMixin, VariableFMADataset):
+	pass
+class MfccNoiseDataset(MfccPrecomputeMixin, DatasedFusedDataset):
+	pass
+
 __all__ = [
 	'VariableFMADataset',
 	'compare_splits',
 	'DatasedFusedDataset',
-	'MelDataset'
+	'MelFMADataset',
+	'MelNoiseDataset',
+	'MfccFMADataset',
+	'MfccNoiseDataset'
 ]

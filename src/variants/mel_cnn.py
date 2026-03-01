@@ -41,16 +41,15 @@ class MelCNNFMAModel(AbstractFMAGenreModule):
 						layers.append(nn.ReLU(inplace=True))
 						layers.append(nn.MaxPool2d((2,2)))
 						in_ch = out_ch
-				layers.append(nn.AdaptiveAvgPool2d((1,None)))  # keep time dimension
+				layers.append(nn.AdaptiveAvgPool2d((1,None)))
 				self.feature_extractor = nn.Sequential(*layers)
 				self.dropout = nn.Dropout(0.3)
 				self.classifier = nn.Linear(conv_channels[-1], num_classes)
 
 		def forward(self, batch_X: torch.Tensor, ids: List[int] = None) -> torch.Tensor:
-				# batch_X is already a tensor from MelDataset, shape [B, 1, 128, T]
 				device = next(self.parameters()).device
 				x = batch_X.to(device)
 				feat = self.feature_extractor(x)
-				feat = feat.mean(dim=3).squeeze(2)  # global time pooling
+				feat = feat.mean(dim=3).squeeze(2)
 				feat = self.dropout(feat)
 				return self.classifier(feat)

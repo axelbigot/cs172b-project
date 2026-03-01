@@ -16,7 +16,7 @@ import soundfile as sf
 
 NON_MUSIC_CLASS = 'X-Non-Music'
 
-class DatasedFusedDataset(VariableFMADataset):
+class DatasedFusedMixin:
 	def __init__(self,
 		datased_zip: PathLike = 'DataSED - Dataset for Sound Event Detection of environmental noise.zip',
 		datased_out = DATA_DIRECTORY,

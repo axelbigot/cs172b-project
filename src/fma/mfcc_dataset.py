@@ -9,7 +9,7 @@ from tqdm import tqdm
 from src.constants import *
 
 
-class MfccDataset(VariableFMADataset):
+class MfccPrecomputeMixin:
 	def __init__(self, *args, mfcc_coeffs: int = 40, fft_window: int = 2048, hop_length: int = 512, **kwargs):
 		super().__init__(*args, **kwargs)
 
@@ -17,7 +17,7 @@ class MfccDataset(VariableFMADataset):
 		self.fft_window = fft_window
 		self.hop_length = hop_length
 
-		cache_path = Path(DATA_DIRECTORY) / f"mfcc_cache_{self.idstr_}.pt"
+		cache_path = Path(DATA_DIRECTORY) / f"mfcc_cache_coeff-{mfcc_coeffs}_fft-{fft_window}_hop-{hop_length}_{self.idstr_}.pt"
 
 		if cache_path.exists():
 			logging.info(f"[MfccDataset] Loading precomputed mfccs from {cache_path}")
