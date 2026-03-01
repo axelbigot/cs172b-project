@@ -129,7 +129,7 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 		epoch = 0
 
-		path = DATA_DIRECTORY / f'model_trained_{self.name()}'
+		path = DATA_DIRECTORY / f'model_trained_{self.name()}_{train_dataset.__class__.__name__}_frac-{train_dataset.dowsample_frac}'
 		log_dir = DATA_DIRECTORY / f'runs/{self.name()}'
 
 		log_dir.mkdir(parents=True, exist_ok=True)

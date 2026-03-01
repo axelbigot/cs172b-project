@@ -9,7 +9,7 @@ import argparse
 from torch.utils.data import DataLoader, random_split
 
 from src.common import AbstractFMAGenreModule
-from src.fma import VariableFMADataset, compare_splits, DatasedFusedDataset, MelDataset
+from src.fma import VariableFMADataset, compare_splits, DatasedFusedDataset, MelDataset, MfccDataset
 from src.variants import *
 from src.constants import *
 
@@ -17,7 +17,8 @@ from src.constants import *
 DATASET_MAP: dict[str, type[VariableFMADataset]] = {
     'fma': VariableFMADataset,
     'fma+noise': DatasedFusedDataset,
-    'mel': MelDataset
+    'mel': MelDataset,
+    'mfcc': MfccDataset
 }
 
 if __name__ == '__main__':

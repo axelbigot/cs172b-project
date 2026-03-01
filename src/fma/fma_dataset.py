@@ -77,6 +77,7 @@ class VariableFMADataset(Dataset):
 			raise RuntimeError(f'Unknown split {split}. Supported values are: {splits}')
 		
 		logging.info(f'[DATASET] Creating {split} dataset')
+		self.dowsample_frac = downsample_frac
 
 		self.idstr_ = f'split-{split}_seed-{RANDOM_SEED}_min-{self.audio_min_sec_}_max-{self.audio_max_sec_}_sr-{self.sampling_rate_}_frac-{downsample_frac}'
 

@@ -12,7 +12,7 @@ class MelDataset(VariableFMADataset):
 	def __init__(self, *args, **kwargs):
 		super().__init__(*args, **kwargs)
 
-		cache_path = Path(DATA_DIRECTORY) / f"mel_cache_{self.split}.pt"
+		cache_path = Path(DATA_DIRECTORY) / f"mel_cache_{self.idstr_}.pt"
 		if cache_path.exists():
 			logging.info(f"[MelDataset] Loading precomputed mels from {cache_path}")
 			self.mels_, self.labels_ = torch.load(cache_path)
