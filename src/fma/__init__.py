@@ -16,6 +16,8 @@ class MfccFMADataset(MfccPrecomputeMixin, VariableFMADataset):
 	pass
 class MfccNoiseDataset(MfccPrecomputeMixin, DatasedFusedDataset):
 	pass
+class MelNoiseMaskingAugmentDataset(MelAugmentMixin, MelNoiseDataset):
+	pass
 
 __all__ = [
 	'VariableFMADataset',
@@ -24,5 +26,6 @@ __all__ = [
 	'MelFMADataset',
 	'MelNoiseDataset',
 	'MfccFMADataset',
-	'MfccNoiseDataset'
+	'MfccNoiseDataset',
+	'MelNoiseMaskingAugmentDataset'
 ]

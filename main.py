@@ -21,6 +21,7 @@ DATASET_MAP: dict[str, type[VariableFMADataset]] = {
     'fma+mfcc': MfccFMADataset,
     'fma+noise+mel': MelNoiseDataset,
     'fma+noise+mfcc': MfccNoiseDataset,
+    'fma+noise+mel+mask': MelNoiseMaskingAugmentDataset
 }
 
 if __name__ == '__main__':

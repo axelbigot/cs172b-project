@@ -184,6 +184,8 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 		for ep in tqdm(range(epoch, num_epochs), desc='Total Epochs'):
 			epoch = ep
+			train_dataset.set_epoch(epoch)
+			val_dataset.set_epoch(epoch)
 
 			self.train()
 			train_loss = 0.0
@@ -249,7 +251,7 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 			writer.add_scalar('Accuracy/Train', train_accuracy, ep)
 			writer.add_scalar('Loss/Validation', val_loss, ep)
 			writer.add_scalar('Accuracy/Validation', val_accuracy, ep)
-			writer.add_scalar('F1/Validation', macro_f1)
+			writer.add_scalar('F1/Validation', macro_f1, ep)
 
 			visualizer.update(
 				epoch,
@@ -283,6 +285,12 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 		if path.exists():
 			cp = torch.load(path, map_location=device)
 			self.load_state_dict(cp['model_state_dict'])
+
+			ep = cp['epoch']
+			test_dataset.set_epoch(ep)
+			logging.info(f'Loaded optimal version from epoch {ep}')
+		else:
+			logging.warning(f'No model at path {path}, testing is occuring on an essentially empty model (untrained). Check that the model name and tag is correct!')
 
 		test_loader = DataLoader(
 			test_dataset,

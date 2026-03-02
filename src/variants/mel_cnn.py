@@ -19,7 +19,7 @@ class MelCNNFMAModel(AbstractFMAGenreModule):
 		@classmethod
 		def train_generic(cls, train_dataset: VariableFMADataset, val_dataset: VariableFMADataset, **kwargs):
 				model = cls(train_dataset.num_classes, **kwargs)
-				model.fma_train(train_dataset, val_dataset, batch_size=16, num_epochs=100)
+				model.fma_train(train_dataset, val_dataset, batch_size=16, num_epochs=150)
 
 		@classmethod
 		def test_generic(cls, test_dataset: VariableFMADataset, **kwargs):
