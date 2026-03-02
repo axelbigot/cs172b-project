@@ -147,6 +147,9 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 		writer = SummaryWriter(log_dir=str(log_dir))
 
+		best_macro_f1 = -float('inf')
+		optimal_path = DATA_DIRECTORY / f'{idstr}-optimal'
+
 		if path.exists():
 			cp = torch.load(path, map_location=device)
 
@@ -159,6 +162,7 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 						state[k] = v.to(device)
 
 			epoch = cp['epoch']
+			best_macro_f1 = cp.get('best_macro_f1', -float('inf'))
 
 		criterion.to(device)
 		self.to(device)
@@ -213,6 +217,18 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 			macro_f1 = f1_score(val_labels.numpy(), val_preds.numpy(), average='macro')
 
+			if macro_f1 > best_macro_f1:
+				best_macro_f1 = macro_f1
+
+				torch.save({
+						'model_state_dict': self.state_dict(),
+						'optimizer_state_dict': optimizer.state_dict(),
+						'epoch': epoch + 1,
+						'best_macro_f1': best_macro_f1
+				}, optimal_path)
+
+				logging.info(f"[CHECKPOINT] New best model saved with val acc {best_macro_f1:.4f}")
+
 			logging.info(
 				f'Epoch {epoch+1}\n'
 				f'\tTrain loss: {train_loss:6f}, accuracy: {(train_accuracy * 100):6f}%\n'
@@ -250,7 +266,8 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 			torch.save({
 				'model_state_dict': self.state_dict(),
 				'optimizer_state_dict': optimizer.state_dict(),
-				'epoch': epoch+1
+				'epoch': epoch+1,
+				'best_macro_f1': best_macro_f1
 			}, path)
 
 	def fma_test(
@@ -260,6 +277,9 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 		device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 	) -> float:
 		path = DATA_DIRECTORY / self.get_idstr(test_dataset)
+		optimal = DATA_DIRECTORY / f'{self.get_idstr(test_dataset)}-optimal'
+		path = optimal if optimal.exists() else path
+
 		if path.exists():
 			cp = torch.load(path, map_location=device)
 			self.load_state_dict(cp['model_state_dict'])
