@@ -23,7 +23,7 @@ class MFCC_CNNFMAModel(AbstractFMAGenreModule):
 
     @classmethod
     def test_generic(cls, test_dataset: VariableFMADataset):
-        model = cls(test_dataset.num_classes)
+        model = cls(test_dataset.num_classes, tag=cls.name())
         acc = model.fma_test(test_dataset)
         print(f'Test accuracy: {acc*100:.2f}%')
 
@@ -31,11 +31,11 @@ class MFCC_CNNFMAModel(AbstractFMAGenreModule):
     def name(cls):
         return 'mfcc-cnn'
 
-    def __init__(self, num_classes: int, conv_channels: tuple[int, ...] = (16, 32, 64, 128), dropout_p: float = 0.5, **kwargs):
+    def __init__(self, num_classes: int, conv_channels: tuple[int, ...] = (16, 32, 64, 128), dropout_p: float = 0.3, **kwargs):
         super().__init__(**kwargs)
 
         self.classifier = nn.Linear(conv_channels[-1], num_classes)
-        self.dropout = nn.Dropout(p = dropout_p)
+        self.dropout = nn.Dropout(dropout_p)
 
         layers = []
         input_ch = 1
@@ -56,5 +56,6 @@ class MFCC_CNNFMAModel(AbstractFMAGenreModule):
         x = batch_X.to(next(self.parameters()).device)
         features = self.feature_extractor(x).flatten(1)
         features = self.dropout(features)
+
         return self.classifier(features)
     

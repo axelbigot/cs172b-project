@@ -14,6 +14,7 @@ from sklearn.metrics import confusion_matrix, f1_score
 
 from src.constants import *
 from src.fma import VariableFMADataset
+from src.model_analyzer import TrainingVisualizer
 
 
 def audio_genre_collate(batch: List[Tuple[callable, torch.LongTensor, int]]) -> Tuple[List[callable], torch.LongTensor, List[int]]:
@@ -174,6 +175,10 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 			collate_fn=self.collate_fn(),
 		)
 
+		idstr = self.get_idstr(train_dataset)
+		visualizer = TrainingVisualizer(train_dataset, idstr)
+		snapshot_interval = max(1, num_epochs // 10)
+
 		for ep in tqdm(range(epoch, num_epochs), desc='Total Epochs'):
 			epoch = ep
 
@@ -229,16 +234,19 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 			writer.add_scalar('Accuracy/Train', train_accuracy, ep)
 			writer.add_scalar('Loss/Validation', val_loss, ep)
 			writer.add_scalar('Accuracy/Validation', val_accuracy, ep)
+			writer.add_scalar('F1/Validation', macro_f1)
 
-			if ep % 20 == 0:
-				idstr = self.get_idstr(train_dataset)
-				dir = Path('analysis') / 'model' / 'validation' / idstr
-				ep_dir = dir / f'epoch_{ep}'
-
-				if ep == 0:
-					# remove all contents of dir
-					pass
-				ep_dir.mkdir(exist_ok=True, parents=True)
+			visualizer.update(
+				epoch,
+				train_loss=train_loss,
+				train_acc=train_accuracy,
+				val_loss=val_loss,
+				val_acc=val_accuracy,
+				macro_f1=macro_f1,
+				per_class_acc=per_class_acc.tolist(),
+				cm=cm,
+				snapshot=(ep % max(1, num_epochs // 10) == 0)
+			)
 
 			torch.save({
 				'model_state_dict': self.state_dict(),
