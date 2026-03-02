@@ -11,13 +11,13 @@ from src.constants import *
 
 class ExampleFMAModel(AbstractFMAGenreModule):
 	@classmethod
-	def train_generic(cls, train_dataset, val_dataset, tag):
-		model = ExampleFMAModel(train_dataset.num_classes, tag=tag)
+	def train_generic(cls, train_dataset, val_dataset, **kwargs):
+		model = ExampleFMAModel(train_dataset.num_classes, **kwargs)
 		model.fma_train(train_dataset, val_dataset, batch_size=4, num_epochs=100)
 
 	@classmethod
-	def test_generic(cls, test_dataset):
-		model = cls(test_dataset.num_classes)
+	def test_generic(cls, test_dataset, **kwargs):
+		model = cls(test_dataset.num_classes, **kwargs)
 		test_accuracy = model.fma_test(test_dataset)
 
 		logging.info(f'Test accuracy: {(test_accuracy * 100):6f}%')

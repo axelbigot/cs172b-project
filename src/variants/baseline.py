@@ -17,13 +17,13 @@ class MelMLPFMAModel(AbstractFMAGenreModule):
 		return mel_baseline_collate
 
 	@classmethod
-	def train_generic(cls, train_dataset: VariableFMADataset, val_dataset: VariableFMADataset, tag: str):
-		model = cls(train_dataset.num_classes, tag=tag)
+	def train_generic(cls, train_dataset: VariableFMADataset, val_dataset: VariableFMADataset, **kwargs):
+		model = cls(train_dataset.num_classes, **kwargs)
 		model.fma_train(train_dataset, val_dataset, batch_size=32, num_epochs=200)
 
 	@classmethod
-	def test_generic(cls, test_dataset: VariableFMADataset):
-		model = cls(test_dataset.num_classes)
+	def test_generic(cls, test_dataset: VariableFMADataset, **kwargs):
+		model = cls(test_dataset.num_classes, **kwargs)
 		acc = model.fma_test(test_dataset)
 		print(f'Test accuracy: {acc*100:.2f}%')
 

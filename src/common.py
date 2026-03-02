@@ -27,7 +27,7 @@ def audio_genre_collate(batch: List[Tuple[callable, torch.LongTensor, int]]) -> 
 class AbstractFMAGenreModule(nn.Module, ABC):
 	@classmethod
 	@abstractmethod
-	def train_generic(cls, train_dataset: VariableFMADataset, val_dataset: VariableFMADataset, tag: str):
+	def train_generic(cls, train_dataset: VariableFMADataset, val_dataset: VariableFMADataset, **kwargs):
 		"""_summary_ Static method that each FMA model must implement which will be called by the main program.
 		This function should delegate to `fma_train`.
 
@@ -42,7 +42,7 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 	@classmethod
 	@abstractmethod
-	def test_generic(cls: type['AbstractFMAGenreModule'], test_dataset: VariableFMADataset):
+	def test_generic(cls: type['AbstractFMAGenreModule'], test_dataset: VariableFMADataset, **kwargs):
 		"""_summary_ Static method that delegates to the unified testing loop.
 
 		Parameters
@@ -259,7 +259,7 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 		batch_size=16,
 		device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 	) -> float:
-		path = DATA_DIRECTORY / f'model_trained_{self.name()}'
+		path = DATA_DIRECTORY / self.get_idstr(test_dataset)
 		if path.exists():
 			cp = torch.load(path, map_location=device)
 			self.load_state_dict(cp['model_state_dict'])

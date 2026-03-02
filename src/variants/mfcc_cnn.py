@@ -18,12 +18,12 @@ class MFCC_CNNFMAModel(AbstractFMAGenreModule):
         return mfcc_collate
     
     @classmethod
-    def train_generic(cls, train_dataset, val_dataset, tag):
-        model = cls(train_dataset.num_classes, tag=tag).fma_train(train_dataset, val_dataset, batch_size=16, num_epochs=750)
+    def train_generic(cls, train_dataset, val_dataset, **kwargs):
+        model = cls(train_dataset.num_classes, **kwargs).fma_train(train_dataset, val_dataset, batch_size=16, num_epochs=750)
 
     @classmethod
-    def test_generic(cls, test_dataset: VariableFMADataset):
-        model = cls(test_dataset.num_classes)
+    def test_generic(cls, test_dataset: VariableFMADataset, **kwargs):
+        model = cls(test_dataset.num_classes, **kwargs)
         acc = model.fma_test(test_dataset)
         print(f'Test accuracy: {acc*100:.2f}%')
 
