@@ -14,8 +14,6 @@ from src.variants import *
 from src.constants import *
 
 
-
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run an FMA model')
     
@@ -30,12 +28,24 @@ if __name__ == '__main__':
         choices=model_names,
         help='The FMA model to run'
     )
+    parser.add_argument(
+        '--frac', 
+        type=float, 
+        default=1.0,
+        help='Fraction of the dataset to use for training/testing (0-1)'
+    )
     
     args = parser.parse_args()
 
     dataset = VariableFMADataset()
-
     n = len(dataset)
+
+    # Apply fraction safely using random_split
+    if args.frac < 1.0:
+        n_frac = int(n * args.frac)
+        logging.info(f'[MAIN] Using {n_frac}/{n} samples ({args.frac*100:.0f}%) for this run.')
+        dataset, _ = random_split(dataset, [n_frac, n - n_frac])
+        n = len(dataset)  # update n
 
     test_sz = int(n * TEST_SPLIT)
     val_sz = int(n * VAL_SPLIT)
@@ -46,10 +56,13 @@ if __name__ == '__main__':
     ModelClass = next(cls for cls in AbstractFMAGenreModule.__subclasses__() if cls.name() == args.model)
 
     if args.action == 'train':
-        logging.info(f'[MAIN] Training model {ModelClass.name()} ({ModelClass.__name__})')
-        ModelClass.train_generic(train_dataset=train_ds, val_dataset=val_ds)
+        model = ModelClass()
+        logging.info(f'[MAIN] Training model {model.name()} ({ModelClass.__name__})')
+        model.train_generic(train_dataset=train_ds, val_dataset=val_ds)
+
     elif args.action == 'test':
-        logging.info(f'[MAIN] Testing model {ModelClass.name()} ({ModelClass.__name__})')
-        ModelClass.test_generic(test_dataset=test_ds)
+        model = ModelClass()
+        logging.info(f'[MAIN] Testing model {model.name()} ({ModelClass.__name__})')
+        model.test_generic(test_dataset=test_ds)
 
     logging.info(f'[MAIN] Graceful end. Goodbye!')

@@ -11,7 +11,7 @@ from tqdm import tqdm
 from os import PathLike
 
 from src.constants import *
-from src.fma import VariableFMADataset, FMATrack
+from src.fma.fma_dataset import VariableFMADataset, FMATrack
 
 
 @dataclass

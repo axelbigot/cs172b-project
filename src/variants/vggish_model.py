@@ -1,107 +1,115 @@
-# src/variants/vggish_model.py
 import torch
 import torch.nn as nn
 import torchaudio
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvggish import vggish
 from tqdm import tqdm
+from functools import partial
 from src.common import AbstractFMAGenreModule
 
-
 # ----------------------------
-# way to process the dataloader
+# Collate function
 # ----------------------------
-def collate_fma(batch):
+def collate_fma(batch, device):
     """
-    Returns:
-        audios: list of 1D torch tensors (variable lengths)
-        labels: torch tensor of genre labels
+    Collate function for FMA datasets. Handles SegmentLoader or raw tensors.
     """
-    audios = [torch.tensor(t.audio, dtype=torch.float32) for t in batch]
-    labels = torch.tensor([t.genre for t in batch], dtype=torch.long)
+    if isinstance(batch[0][0], torch.Tensor):
+        audios = [t[0] for t in batch]
+        labels = torch.tensor([t[1] for t in batch], dtype=torch.long)
+    else:
+        audios = [t[0](device) for t in batch]
+        labels = torch.tensor([t[1] for t in batch], dtype=torch.long)
     return audios, labels
 
-
 # ----------------------------
-# Preprocessing for the Tensors
-# ----------------------------
-def waveform_to_examples_tensor(waveform: torch.Tensor, sr: int = 22050):
-    """
-    Converts 1D waveform tensor to VGGish examples tensor.
-    Returns: [num_examples, 1, 96, 64]
-    """
-    device = waveform.device
-    target_sr = 16000
-
-    if sr != target_sr:
-        resampler = torchaudio.transforms.Resample(sr, target_sr).to(device)
-        waveform = resampler(waveform.unsqueeze(0)).squeeze(0)
-
-    mel_spec = torchaudio.transforms.MelSpectrogram(
-        sample_rate=target_sr,
-        n_fft=400,
-        hop_length=160,
-        n_mels=64
-    ).to(device)
-
-    mel = mel_spec(waveform.unsqueeze(0))
-    log_mel = torch.log(mel + 1e-6).transpose(1, 2)
-
-    frame_size = 96
-    examples = []
-
-    for start in range(0, log_mel.size(1) - frame_size + 1, frame_size):
-        examples.append(log_mel[:, start:start + frame_size, :])
-
-    if not examples:
-        pad = torch.zeros(1, frame_size, 64, device=device)
-        examples = [pad]
-
-    examples_tensor = torch.cat(examples, dim=0)
-    examples_tensor = examples_tensor.unsqueeze(1)
-    return examples_tensor
-
-
-# ----------------------------
-# VGG model for FMA
+# VGGish model for FMA
 # ----------------------------
 class VGGishFMA(AbstractFMAGenreModule):
-
     MODEL_PATH = "vggish_fma_best.pt"
 
     def __init__(self):
         super().__init__()
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        self.model = vggish()
-        self.model.eval()  # frozen feature extractor
-        self.model.to(self.device)
+        # VGGish backbone
+        self.model = vggish().to(self.device)
 
-        self.classifier = nn.Linear(128, 16)
-        self.classifier.to(self.device)
+        # Classifier head
+        self.classifier = nn.Sequential(
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 16)
+        ).to(self.device)
+
+        # Audio transforms
+        self.target_sr = 16000
+        self.resampler = torchaudio.transforms.Resample(22050, self.target_sr)
+        self.mel_spec = torchaudio.transforms.MelSpectrogram(
+            sample_rate=self.target_sr,
+            n_fft=400,
+            hop_length=160,
+            n_mels=64
+        )
 
     @staticmethod
     def name():
         return "vggish"
 
-    def forward(self, batch):
+    # ----------------------------
+    # Convert waveform to VGGish examples
+    # ----------------------------
+    def waveform_to_examples(self, waveforms: list, srs: list = None):
+        if srs is None:
+            srs = [22050] * len(waveforms)
 
-        device = self.device
-        all_embeddings = []
+        batch_examples = []
         batch_sizes = []
-        examples_list = []
+        frame_size = 96  # VGGish expects 96-frame patches
 
-        for audio in batch:
-            audio = audio.float().to(device)
-            examples = waveform_to_examples_tensor(audio, sr=22050).to(device)
-            examples_list.append(examples)
+        for waveform, sr in zip(waveforms, srs):
+            # Resample if needed
+            if sr != self.target_sr:
+                waveform = self.resampler(waveform.unsqueeze(0)).squeeze(0)
+
+            # Ensure waveform is long enough for MelSpectrogram
+            min_len = self.mel_spec.n_fft + (frame_size - 1) * self.mel_spec.hop_length
+            if waveform.numel() < min_len:
+                pad_size = min_len - waveform.numel()
+                waveform = torch.nn.functional.pad(waveform, (0, pad_size))
+
+            # Compute log-Mel spectrogram
+            mel = self.mel_spec(waveform.unsqueeze(0))
+            log_mel = torch.log(mel + 1e-6).squeeze(0).transpose(0, 1)  # (time, n_mels)
+
+            # Pad frames if too short
+            if log_mel.size(0) < frame_size:
+                pad_frames = frame_size - log_mel.size(0)
+                pad = torch.zeros(pad_frames, log_mel.size(1), device=log_mel.device)
+                log_mel = torch.cat([log_mel, pad], dim=0)
+
+            # Split into 96-frame examples
+            num_examples = log_mel.size(0) // frame_size
+            examples = log_mel[:num_examples*frame_size].unfold(0, frame_size, frame_size)
+            if examples.dim() == 2:
+                examples = examples.unsqueeze(0)
+            examples = examples.unsqueeze(1)  # (N, 1, 96, 64)
+
+            batch_examples.append(examples)
             batch_sizes.append(examples.size(0))
 
-        all_examples = torch.cat(examples_list, dim=0)
+        all_examples = torch.cat(batch_examples, dim=0).to(self.device)
+        return all_examples, batch_sizes
 
-        with torch.no_grad():
-            embeddings = self.model(all_examples)
+    # ----------------------------
+    # Forward pass
+    # ----------------------------
+    def forward(self, batch):
+        all_examples, batch_sizes = self.waveform_to_examples(batch)
+        embeddings = self.model(all_examples)
 
+        all_embeddings = []
         start = 0
         for size in batch_sizes:
             emb = embeddings[start:start + size].mean(dim=0)
@@ -110,120 +118,96 @@ class VGGishFMA(AbstractFMAGenreModule):
 
         all_embeddings = torch.stack(all_embeddings)
         logits = self.classifier(all_embeddings)
-
         return logits
 
     # ----------------------------
-    # Training Loop
+    # Training tried to implement precomputing but the input would be wrong
     # ----------------------------
-    @staticmethod
-    def train_generic(train_dataset, val_dataset, batch_size=2, epochs=25):
-
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        model = VGGishFMA().to(device)
-
-        optimizer = torch.optim.Adam(model.classifier.parameters(), lr=1e-3)
-        criterion = nn.CrossEntropyLoss()
+    def train_generic(self, train_dataset, val_dataset, batch_size=16, epochs=5):
+        device = self.device
 
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
-            collate_fn=collate_fma
+            collate_fn=partial(collate_fma, device=device),
+            num_workers=4,
+            pin_memory=True
         )
 
         val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,
-            collate_fn=collate_fma
+            collate_fn=partial(collate_fma, device=device),
+            num_workers=4,
+            pin_memory=True
         )
 
+        optimizer = torch.optim.Adam([
+            {"params": self.model.parameters(), "lr": 1e-5},
+            {"params": self.classifier.parameters(), "lr": 1e-3}
+        ])
+        criterion = nn.CrossEntropyLoss()
         best_val_acc = 0.0
 
-        for epoch in tqdm(range(epochs), desc="Training Progress"):
-
-            model.classifier.train()
+        for epoch in range(epochs):
+            self.train()
             running_loss = 0.0
 
-            train_bar = tqdm(train_loader,
-                             desc=f"Epoch [{epoch+1}/{epochs}]",
-                             leave=False)
-
-            for audios, labels in train_bar:
-
+            for audios, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False):
                 labels = labels.to(device)
                 optimizer.zero_grad()
-
-                logits = model.forward(audios)
+                logits = self.forward(audios)
                 loss = criterion(logits, labels)
-
                 loss.backward()
                 optimizer.step()
-
                 running_loss += loss.item()
-                train_bar.set_postfix(loss=loss.item())
 
             avg_loss = running_loss / len(train_loader)
-            print(f"\nEpoch [{epoch+1}/{epochs}] completed | Avg Loss: {avg_loss:.4f}")
 
-            # ---------------- Validation ----------------
-            model.classifier.eval()
-            val_correct, val_total = 0, 0
-
+            # Validation
+            self.eval()
+            correct, total = 0, 0
             with torch.no_grad():
-                val_bar = tqdm(val_loader, desc="Validating", leave=False)
-
-                for audios, labels in val_bar:
+                for audios, labels in val_loader:
                     labels = labels.to(device)
-
-                    logits = model.forward(audios)
+                    logits = self.forward(audios)
                     preds = logits.argmax(dim=1)
+                    correct += (preds == labels).sum().item()
+                    total += len(labels)
 
-                    val_correct += (preds == labels).sum().item()
-                    val_total += len(labels)
+            val_acc = correct / total
+            print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f}")
 
-            val_acc = val_correct / val_total
-            print(f"Validation accuracy: {val_acc:.4f}")
-
-            # Save best model
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
-                torch.save(model.state_dict(), VGGishFMA.MODEL_PATH)
-                print(f"New best model saved (val_acc={val_acc:.4f})")
+                torch.save(self.state_dict(), self.MODEL_PATH)
+                print("New best model saved.")
 
         print("Training complete.")
 
     # ----------------------------
-    # Testing Loop
+    # Testing
     # ----------------------------
-    @staticmethod
-    def test_generic(test_dataset, batch_size=2):
-
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        model = VGGishFMA().to(device)
-
-        # Load trained weights
-        model.load_state_dict(torch.load(VGGishFMA.MODEL_PATH, map_location=device))
-        model.classifier.eval()
-        print("Loaded trained model.")
+    def test_generic(self, test_dataset, batch_size=16):
+        device = self.device
+        self.load_state_dict(torch.load(self.MODEL_PATH, map_location=device))
+        self.eval()
 
         test_loader = DataLoader(
             test_dataset,
             batch_size=batch_size,
-            collate_fn=collate_fma
+            collate_fn=partial(collate_fma, device=device),
+            num_workers=4,
+            pin_memory=True
         )
 
         correct, total = 0, 0
-
         with torch.no_grad():
-            test_bar = tqdm(test_loader, desc="Testing")
-
-            for audios, labels in test_bar:
+            for audios, labels in tqdm(test_loader, desc="Testing"):
                 labels = labels.to(device)
-
-                logits = model.forward(audios)
+                logits = self.forward(audios)
                 preds = logits.argmax(dim=1)
-
                 correct += (preds == labels).sum().item()
                 total += len(labels)
 
