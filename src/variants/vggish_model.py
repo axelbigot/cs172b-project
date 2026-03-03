@@ -24,9 +24,11 @@ class VGGishFMA(AbstractFMAGenreModule):
         # VGGish backbone + classifier head
         self.model = vggish().to(self.device)
 
-        # Move VGGish's internal PCA buffers to the correct device
-        self.model._pca_matrix = self.model._pca_matrix.to(self.device)
-        self.model._pca_means = self.model._pca_means.to(self.device)
+        # Move PCA buffers to device if they exist
+        if hasattr(self.model, '_pca_matrix'):
+            self.model._pca_matrix = self.model._pca_matrix.to(self.device)
+        if hasattr(self.model, '_pca_means'):
+            self.model._pca_means = self.model._pca_means.to(self.device)
 
         self.classifier = nn.Sequential(
             nn.Linear(128, 256),
@@ -40,12 +42,6 @@ class VGGishFMA(AbstractFMAGenreModule):
         return "vggish"
 
     def forward(self, frames: torch.Tensor, track_sizes: list) -> torch.Tensor:
-        """
-        frames      : (total_windows, 1, 64, 96) — all windows for the batch
-        track_sizes : list[int] — how many windows belong to each track
-
-        Returns logits: (B, 16)
-        """
         embeddings = self.model(frames)         # (total_windows, 128)
 
         # Mean-pool window embeddings back to one per track
