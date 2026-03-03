@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torchaudio
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from torchvggish import vggish
 from tqdm import tqdm
 from functools import partial
@@ -28,8 +28,8 @@ def collate_fma(batch, device):
 class VGGishFMA(AbstractFMAGenreModule):
     MODEL_PATH = "vggish_fma_best.pt"
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, tag: str = ""):
+        super().__init__(tag)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # VGGish backbone
@@ -53,8 +53,11 @@ class VGGishFMA(AbstractFMAGenreModule):
             n_mels=64
         )
 
-    @staticmethod
-    def name():
+    # ----------------------------
+    # Class method for parser
+    # ----------------------------
+    @classmethod
+    def name(cls):
         return "vggish"
 
     # ----------------------------
@@ -69,32 +72,26 @@ class VGGishFMA(AbstractFMAGenreModule):
         frame_size = 96  # VGGish expects 96-frame patches
 
         for waveform, sr in zip(waveforms, srs):
-            # Resample if needed
             if sr != self.target_sr:
                 waveform = self.resampler(waveform.unsqueeze(0)).squeeze(0)
 
-            # Ensure waveform is long enough for MelSpectrogram
             min_len = self.mel_spec.n_fft + (frame_size - 1) * self.mel_spec.hop_length
             if waveform.numel() < min_len:
                 pad_size = min_len - waveform.numel()
                 waveform = torch.nn.functional.pad(waveform, (0, pad_size))
 
-            # Compute log-Mel spectrogram
             mel = self.mel_spec(waveform.unsqueeze(0))
-            log_mel = torch.log(mel + 1e-6).squeeze(0).transpose(0, 1)  # (time, n_mels)
+            log_mel = torch.log(mel + 1e-6).squeeze(0).transpose(0, 1)
 
-            # Pad frames if too short
             if log_mel.size(0) < frame_size:
                 pad_frames = frame_size - log_mel.size(0)
-                pad = torch.zeros(pad_frames, log_mel.size(1), device=log_mel.device)
-                log_mel = torch.cat([log_mel, pad], dim=0)
+                log_mel = torch.cat([log_mel, torch.zeros(pad_frames, log_mel.size(1), device=log_mel.device)], dim=0)
 
-            # Split into 96-frame examples
             num_examples = log_mel.size(0) // frame_size
             examples = log_mel[:num_examples*frame_size].unfold(0, frame_size, frame_size)
             if examples.dim() == 2:
                 examples = examples.unsqueeze(0)
-            examples = examples.unsqueeze(1)  # (N, 1, 96, 64)
+            examples = examples.unsqueeze(1)
 
             batch_examples.append(examples)
             batch_sizes.append(examples.size(0))
@@ -121,7 +118,7 @@ class VGGishFMA(AbstractFMAGenreModule):
         return logits
 
     # ----------------------------
-    # Training tried to implement precomputing but the input would be wrong
+    # Training
     # ----------------------------
     def train_generic(self, train_dataset, val_dataset, batch_size=16, epochs=5):
         device = self.device
@@ -165,7 +162,6 @@ class VGGishFMA(AbstractFMAGenreModule):
 
             avg_loss = running_loss / len(train_loader)
 
-            # Validation
             self.eval()
             correct, total = 0, 0
             with torch.no_grad():
@@ -191,9 +187,13 @@ class VGGishFMA(AbstractFMAGenreModule):
     # ----------------------------
     def test_generic(self, test_dataset, batch_size=16):
         device = self.device
-        self.load_state_dict(torch.load(self.MODEL_PATH, map_location=device))
-        self.eval()
+        try:
+            self.load_state_dict(torch.load(self.MODEL_PATH, map_location=device))
+        except FileNotFoundError:
+            print(f"No saved model found at {self.MODEL_PATH}. Run training first.")
+            return
 
+        self.eval()
         test_loader = DataLoader(
             test_dataset,
             batch_size=batch_size,

@@ -1,4 +1,4 @@
-from .vggish_model import VGGishFMA
+from src.variants.vggish_model import VGGishFMA
 
 __all__ = [
     "VGGishFMA"
