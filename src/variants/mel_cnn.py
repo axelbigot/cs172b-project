@@ -19,7 +19,8 @@ class MelCNNFMAModel(AbstractFMAGenreModule):
 	@classmethod
 	def train_generic(cls, train_dataset: VariableFMADataset, val_dataset: VariableFMADataset, **kwargs):
 			model = cls(train_dataset.num_classes, **kwargs)
-			model.fma_train(train_dataset, val_dataset, batch_size=16, num_epochs=150, early_stopping_patience=10)
+			optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+			model.fma_train(train_dataset, val_dataset, batch_size=16, num_epochs=150, early_stopping_patience=10, optimizer=optimizer)
 
 	@classmethod
 	def test_generic(cls, test_dataset: VariableFMADataset, **kwargs):
@@ -43,7 +44,7 @@ class MelCNNFMAModel(AbstractFMAGenreModule):
 			in_ch = out_ch
 		layers.append(nn.AdaptiveAvgPool2d((1,None)))
 		self.feature_extractor = nn.Sequential(*layers)
-		self.dropout = nn.Dropout(0.3)
+		self.dropout = nn.Dropout(0.45)
 		# self.classifier = nn.Linear(conv_channels[-1], num_classes)
 		self.classifier = nn.Linear(conv_channels[-1] * 2, num_classes)
 
