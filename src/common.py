@@ -11,16 +11,11 @@ from tqdm import tqdm
 from os import PathLike
 
 from src.constants import *
-from src.fma import VariableFMADataset, FMATrack
+from src.fma import VariableFMADataset
 
 
 @dataclass
 class FMATrackBatch:
-	"""_summary_ Batched FMATracks.
-
-	Note that the `audios` member is a list of variable-length tensors and may need some preprocessing
-	for certain models (in `forward`).
-	"""
 	audios: list[torch.Tensor]
 	lengths: torch.Tensor
 	track_ids: torch.Tensor
@@ -28,86 +23,36 @@ class FMATrackBatch:
 	features: torch.Tensor
 	echonests: torch.Tensor
 
-def fma_track_collate(batch: list[FMATrack]) -> FMATrackBatch:
-	"""_summary_ Collation function for batching FMATracks.
-
-	Parameters
-	----------
-	batch : list[FMATrack]
-			_description_ Raw FMATracks in the batch.
-
-	Returns
-	-------
-	FMATrackBatch
-			_description_ Batched FMATracks.
-	"""
+def fma_track_collate(batch) -> FMATrackBatch:
 	return FMATrackBatch(
 		audios=[torch.tensor(b.audio) for b in batch],
 		lengths=torch.tensor([b.length for b in batch], dtype=torch.float32),
 		track_ids=torch.tensor([b.track_id for b in batch], dtype=torch.int32),
 		genres=torch.tensor([b.genre for b in batch], dtype=torch.long),
 		features=torch.from_numpy(np.stack([b.features for b in batch], axis=0)).float(),
-    echonests=torch.from_numpy(np.stack([b.echonest for b in batch], axis=0)).float()
+		echonests=torch.from_numpy(np.stack([b.echonest for b in batch], axis=0)).float()
 	)
 
 class AbstractFMAGenreModule(nn.Module, ABC):
 	@classmethod
 	@abstractmethod
 	def train_generic(cls, train_dataset: Subset, val_dataset: Subset):
-		"""_summary_ Static method that each FMA model must implement which will be called by the main program.
-		This function should delegate to `fma_train`.
-
-		Parameters
-		----------
-		train_dataset : Subset
-				_description_ Training dataset (train split)
-		val_dataset : Subset
-				_description_ Validation dataset (validation split)
-		"""
 		pass
 
 	@classmethod
 	def test_generic(cls: type['AbstractFMAGenreModule'], test_dataset: Subset):
-		"""_summary_ Static method that delegates to the unified testing loop.
-
-		Parameters
-		----------
-		test_dataset : Subset
-				_description_ Test dataset (test split of data).
-		"""
 		model = cls()
 		test_accuracy = model.fma_test(test_dataset)
-
 		logging.info(f'Test accuracy: {(test_accuracy * 100):6f}%')
 
 	@classmethod
 	@abstractmethod
 	def name(cls) -> str:
-		"""_summary_ Static method that each FMA model must implement which returns the display name of the
-		model. This will be used my the main program as the CLI arg to run this specific model.
-
-		Returns
-		-------
-		str
-				_description_ Display name (ideally short). This value must be unique compared to other models.
-		"""
 		pass
-	
-	@abstractmethod
-	def forward(self, track: FMATrackBatch) -> torch.Tensor:
-		"""_summary_ Forward method of the model.
 
-		Parameters
-		----------
-		track : FMATrackBatch
-				_description_ Batched FMA tracks.
-
-		Returns
-		-------
-		torch.Tensor
-				_description_ Logits tensor.
-		"""
-		pass
+	def forward(self, *args, **kwargs) -> torch.Tensor:
+		"""Forward method — signature varies by model."""
+		raise NotImplementedError
 
 	def fma_train(
 		self,
@@ -120,28 +65,6 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 		num_epochs: int=10,
 		device: str='cuda' if torch.cuda.is_available() else 'cpu'
 	):
-		"""_summary_ Parameterized unified training loop for all models. This function should be invoked by
-		the model's `train_generic`.
-
-		Parameters
-		----------
-		train_dataset : Subset
-				_description_, Training dataset (train split)
-		val_dataset : Subset
-				_description_, Validation dataset (validation split)
-		batch_size : int, optional
-				_description_, by default 16
-		optimizer : torch.optim.Optimizer | None, optional
-				_description_, by default None
-		criterion : torch.nn.Module | None, optional
-				_description_, by default None
-		lr : float, optional
-				_description_, by default 1e-3
-		num_epochs : int, optional
-				_description_, by default 10
-		device : str, optional
-				_description_, by default 'cuda'iftorch.cuda.is_available()else'cpu'
-		"""
 		logging.info(f'[TRAINING] Using device "{device}"')
 
 		if optimizer is None:
@@ -235,8 +158,8 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 			}, path)
 
 	def fma_test(
-		self, 
-		test_dataset: Subset, 
+		self,
+		test_dataset: Subset,
 		device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 	) -> float:
 		path = DATA_DIRECTORY / f'model_trained_{self.name()}'
@@ -249,7 +172,7 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 			shuffle=True,
 			collate_fn=fma_track_collate
 		)
-		
+
 		self.to(device)
 		self.eval()
 
@@ -269,9 +192,9 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 	@torch.no_grad()
 	def evaluate(
-		self, 
-		loader: DataLoader, 
-		device: str, 
+		self,
+		loader: DataLoader,
+		device: str,
 		criterion: nn.Module
 	) -> tuple[float, float]:
 		self.eval()

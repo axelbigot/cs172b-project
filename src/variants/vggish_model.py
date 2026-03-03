@@ -15,8 +15,7 @@ from src.model_analyzer import TrainingVisualizer
 from src.constants import DATA_DIRECTORY
 from src.fma.vgg_dataset import VGGishFrameDataset, collate_vggish_frames
 
-FREEZE_EPOCHS = 5       # epochs to train classifier only before unfreezing backbone
-EARLY_STOP_PATIENCE = 10  # stop if val acc doesn't improve for this many epochs
+FREEZE_EPOCHS = 5  # epochs to train classifier only before unfreezing backbone
 
 
 class VGGishFMA(AbstractFMAGenreModule):
@@ -102,11 +101,6 @@ class VGGishFMA(AbstractFMAGenreModule):
         idstr = self.get_idstr(train_dataset)
         visualizer = TrainingVisualizer(train_dataset, idstr=idstr)
         checkpoint_path = Path(DATA_DIRECTORY) / f"{idstr}-checkpoint.pt"
-        best_checkpoint_path = Path(DATA_DIRECTORY) / f"{idstr}-best.pt"
-
-        # Early stopping state
-        best_val_acc = 0.0
-        epochs_no_improve = 0
 
         # Start with frozen backbone
         logging.info("[TRAIN] Freezing VGGish backbone for first %d epochs", FREEZE_EPOCHS)
@@ -114,7 +108,7 @@ class VGGishFMA(AbstractFMAGenreModule):
             param.requires_grad = False
 
         optimizer = torch.optim.Adam(self.classifier.parameters(), lr=lr)
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.7)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
 
         for epoch in range(1, epochs + 1):
 
@@ -123,11 +117,12 @@ class VGGishFMA(AbstractFMAGenreModule):
                 logging.info("[TRAIN] Unfreezing VGGish backbone")
                 for param in self.model.parameters():
                     param.requires_grad = True
+                # Rebuild optimizer to include backbone params
                 optimizer = torch.optim.Adam(
                     list(self.model.parameters()) + list(self.classifier.parameters()),
                     lr=lr
                 )
-                scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.7)
+                scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
 
             # -------- Train --------
             self.model.train()
@@ -190,35 +185,12 @@ class VGGishFMA(AbstractFMAGenreModule):
                 f"LR: {scheduler.get_last_lr()[0]:.6f}"
             )
 
-            # Save checkpoint every epoch
             torch.save({
                 'model_state_dict':      self.model.state_dict(),
                 'classifier_state_dict': self.classifier.state_dict(),
                 'optimizer_state_dict':  optimizer.state_dict(),
                 'epoch':                 epoch,
             }, checkpoint_path)
-
-            # Save best model
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                epochs_no_improve = 0
-                torch.save({
-                    'model_state_dict':      self.model.state_dict(),
-                    'classifier_state_dict': self.classifier.state_dict(),
-                    'optimizer_state_dict':  optimizer.state_dict(),
-                    'epoch':                 epoch,
-                    'val_acc':               val_acc,
-                }, best_checkpoint_path)
-                logging.info(f"[TRAIN] New best val acc: {val_acc:.4f} — saved to {best_checkpoint_path}")
-            else:
-                epochs_no_improve += 1
-                logging.info(f"[TRAIN] No improvement for {epochs_no_improve}/{EARLY_STOP_PATIENCE} epochs")
-
-            # Early stopping
-            if epochs_no_improve >= EARLY_STOP_PATIENCE:
-                print(f"Early stopping at epoch {epoch} — no improvement for {EARLY_STOP_PATIENCE} epochs")
-                print(f"Best val acc: {best_val_acc:.4f}")
-                break
 
         return visualizer
 
