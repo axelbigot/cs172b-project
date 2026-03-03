@@ -30,6 +30,8 @@ if __name__ == '__main__':
     
     model_names = [cls.name() for cls in AbstractFMAGenreModule.__subclasses__()]
 
+    custom_parser = subparsers.add_parser('custom')
+
     train_parser = subparsers.add_parser('train')
     train_parser.add_argument(
         'model',
@@ -44,13 +46,20 @@ if __name__ == '__main__':
         help='The FMA model to test'
     )
 
-    for p in [train_parser, test_parser]:
+    for p in [train_parser, test_parser, custom_parser]:
         p.add_argument(
             '--tag',
             type=str,
             default='',
             help='Specify a tag to append to the name of the model to make it unique'
         )
+
+    custom_parser.add_argument(
+        '--frac',
+        type=float,
+        default=1.0,
+        help='Fraction of dataset to use [0,1]'
+    )
 
     analyze_parser = subparsers.add_parser('analyze-ds')
 
@@ -70,38 +79,73 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
 
-    frac = args.frac
-    DatasetClass: type[VariableFMADataset] = DATASET_MAP[args.dataset]
+    if args.action == 'custom':
+        tst_accuracies = {}
 
-    if args.action == 'analyze-ds':
-        logging.info(f'[MAIN] (Re)Generating dataset analysis')
-        train_ds = DatasetClass(split='training', downsample_frac=frac)
-        val_ds = DatasetClass(split='validation', downsample_frac=frac, genre_encoder=train_ds.genre_encoder)
-        test_ds = DatasetClass(split='test', downsample_frac=frac, genre_encoder=train_ds.genre_encoder)
+        tr_dataset = MelNoiseMaskingAugmentDataset(split='training', downsample_frac=args.frac)
+        val_dataset = MelNoiseMaskingAugmentDataset(split='validation', downsample_frac=args.frac, genre_encoder=tr_dataset.genre_encoder)
+        tst_dataset = MelNoiseMaskingAugmentDataset(split='test', downsample_frac=args.frac, genre_encoder=tr_dataset.genre_encoder)
 
-        trn_an = train_ds.analyzer()
-        val_an = val_ds.analyzer()
-        tst_an = test_ds.analyzer()
+        for lr in [1e-3, 5e-4, 1e-4]:
+            for temporal_kernel in [3, 5]:
+                for batch_size in [8, 16, 32]:
+                    unique_tag = f'tg-{args.tag}_lr-{lr}_tempk-{temporal_kernel}_bs-{batch_size}'
+                    model = MelCNNFMAModelV2(
+                        tr_dataset.num_classes,
+                        tag=unique_tag,
+                        conv_channels=(64,64,128),
+                        temporal_kernel_size=temporal_kernel
+                    )
+                    model.fma_train(
+                        tr_dataset,
+                        val_dataset,
+                        batch_size=batch_size,
+                        optimizer=None,
+                        criterion=None,
+                        lr=lr,
+                        num_epochs=150,
+                        early_stopping_patience=10
+                    )
+                    tst_acc = model.fma_test(tst_dataset)
+                    tst_accuracies[unique_tag] = tst_acc
+                    print(f'{unique_tag} : {tst_acc*100:.2f}%')
 
-        for an in [trn_an, val_an, tst_an]:
-            an.simple()
-            an.visual()
+        for tag in sorted(tst_accuracies, key=tst_accuracies.get, reverse=True):
+            print(f'{tag} : {tst_accuracies[tag]*100:.2f}%')
 
-        compare_splits(trn_an, val_an, tst_an)
     else:
-        ModelClass = next(cls for cls in AbstractFMAGenreModule.__subclasses__() if cls.name() == args.model)
-        train_ds = DatasetClass(split='training', downsample_frac=frac)
+        frac = args.frac
+        DatasetClass: type[VariableFMADataset] = DATASET_MAP[args.dataset]
 
-        if args.action == 'train':
-            logging.info(f'[MAIN] Training model {ModelClass.name()} ({ModelClass.__name__})')
+        if args.action == 'analyze-ds':
+            logging.info(f'[MAIN] (Re)Generating dataset analysis')
+            train_ds = DatasetClass(split='training', downsample_frac=frac)
             val_ds = DatasetClass(split='validation', downsample_frac=frac, genre_encoder=train_ds.genre_encoder)
-
-            ModelClass.train_generic(train_dataset=train_ds, val_dataset=val_ds, tag=args.tag)
-        elif args.action == 'test':
-            logging.info(f'[MAIN] Testing model {ModelClass.name()} ({ModelClass.__name__})')
             test_ds = DatasetClass(split='test', downsample_frac=frac, genre_encoder=train_ds.genre_encoder)
 
-            ModelClass.test_generic(test_dataset=test_ds, tag=args.tag)
+            trn_an = train_ds.analyzer()
+            val_an = val_ds.analyzer()
+            tst_an = test_ds.analyzer()
+
+            for an in [trn_an, val_an, tst_an]:
+                an.simple()
+                an.visual()
+
+            compare_splits(trn_an, val_an, tst_an)
+        else:
+            ModelClass = next(cls for cls in AbstractFMAGenreModule.__subclasses__() if cls.name() == args.model)
+            train_ds = DatasetClass(split='training', downsample_frac=frac)
+
+            if args.action == 'train':
+                logging.info(f'[MAIN] Training model {ModelClass.name()} ({ModelClass.__name__})')
+                val_ds = DatasetClass(split='validation', downsample_frac=frac, genre_encoder=train_ds.genre_encoder)
+
+                ModelClass.train_generic(train_dataset=train_ds, val_dataset=val_ds, tag=args.tag)
+            elif args.action == 'test':
+                logging.info(f'[MAIN] Testing model {ModelClass.name()} ({ModelClass.__name__})')
+                test_ds = DatasetClass(split='test', downsample_frac=frac, genre_encoder=train_ds.genre_encoder)
+
+                ModelClass.test_generic(test_dataset=test_ds, tag=args.tag)
 
 
     logging.info(f'[MAIN] Graceful end. Goodbye!')
