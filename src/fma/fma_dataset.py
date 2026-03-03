@@ -71,6 +71,7 @@ class VariableFMADataset(Dataset):
 		self.fma_small_out_ = Path(fma_small_out) / 'fma_small'
 
 		self.split = split
+		self.epoch = 0
 
 		splits = ['training', 'validation', 'test']
 		if split not in splits:
@@ -210,6 +211,9 @@ class VariableFMADataset(Dataset):
 			audio_start_pos=[t['start'] for t in self.index_],
 			audio_end_pos=[t['end'] for t in self.index_],
 		)
+	
+	def set_epoch(self, ep: int):
+		self.epoch = ep
 	
 	def create_encoder(self, current_encoder: LabelEncoder) -> LabelEncoder:
 		return current_encoder

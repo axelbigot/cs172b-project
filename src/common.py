@@ -10,7 +10,9 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from os import PathLike
 from typing import List, Tuple
-from sklearn.metrics import confusion_matrix, f1_score
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 from src.constants import *
 from src.fma import VariableFMADataset
@@ -103,7 +105,8 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 		criterion: torch.nn.Module | None = None,
 		lr: float=1e-3,
 		num_epochs: int=10,
-		device: str='cuda' if torch.cuda.is_available() else 'cpu'
+		device: str='cuda' if torch.cuda.is_available() else 'cpu',
+		early_stopping_patience: int | None = None
 	):
 		"""_summary_ Parameterized unified training loop for all models. This function should be invoked by
 		the model's `train_generic`.
@@ -150,6 +153,8 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 		best_macro_f1 = -float('inf')
 		optimal_path = DATA_DIRECTORY / f'{idstr}-optimal'
 
+		no_improve_epochs = 0
+
 		if path.exists():
 			cp = torch.load(path, map_location=device)
 
@@ -184,6 +189,8 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 		for ep in tqdm(range(epoch, num_epochs), desc='Total Epochs'):
 			epoch = ep
+			train_dataset.set_epoch(epoch)
+			val_dataset.set_epoch(epoch)
 
 			self.train()
 			train_loss = 0.0
@@ -217,6 +224,16 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 			macro_f1 = f1_score(val_labels.numpy(), val_preds.numpy(), average='macro')
 
+			if early_stopping_patience is not None and early_stopping_patience > 0:
+				if macro_f1 > best_macro_f1:
+					no_improve_epochs = 0
+				else:
+					no_improve_epochs += 1
+
+				if no_improve_epochs >= early_stopping_patience:
+					logging.info(f"[EARLY STOPPING] No improvement in {early_stopping_patience} epochs. Stopping training.")
+					break
+
 			if macro_f1 > best_macro_f1:
 				best_macro_f1 = macro_f1
 
@@ -249,7 +266,7 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 			writer.add_scalar('Accuracy/Train', train_accuracy, ep)
 			writer.add_scalar('Loss/Validation', val_loss, ep)
 			writer.add_scalar('Accuracy/Validation', val_accuracy, ep)
-			writer.add_scalar('F1/Validation', macro_f1)
+			writer.add_scalar('F1/Validation', macro_f1, ep)
 
 			visualizer.update(
 				epoch,
@@ -270,43 +287,106 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 				'best_macro_f1': best_macro_f1
 			}, path)
 
+	@torch.no_grad
 	def fma_test(
-		self, 
-		test_dataset: VariableFMADataset, 
-		batch_size=16,
-		device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+			self, 
+			test_dataset: VariableFMADataset, 
+			batch_size=16,
+			device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 	) -> float:
-		path = DATA_DIRECTORY / self.get_idstr(test_dataset)
-		optimal = DATA_DIRECTORY / f'{self.get_idstr(test_dataset)}-optimal'
-		path = optimal if optimal.exists() else path
+			path = DATA_DIRECTORY / self.get_idstr(test_dataset)
+			optimal = DATA_DIRECTORY / f'{self.get_idstr(test_dataset)}-optimal'
+			path = optimal if optimal.exists() else path
 
-		if path.exists():
-			cp = torch.load(path, map_location=device)
-			self.load_state_dict(cp['model_state_dict'])
+			if path.exists():
+					cp = torch.load(path, map_location=device)
+					self.load_state_dict(cp['model_state_dict'])
+					ep = cp['epoch']
+					test_dataset.set_epoch(ep)
+					logging.info(f'Loaded optimal version from epoch {ep}')
+			else:
+					logging.warning(f'No model at path {path}, testing is occurring on an essentially empty model.')
 
-		test_loader = DataLoader(
-			test_dataset,
-			shuffle=False,
-			batch_size=batch_size,
-			collate_fn=self.collate_fn()
-		)
-		
-		self.to(device)
-		self.eval()
+			test_loader = DataLoader(
+					test_dataset,
+					shuffle=False,
+					batch_size=batch_size,
+					collate_fn=self.collate_fn()
+			)
+			
+			self.to(device)
+			self.eval()
 
-		correct = 0
-		total = 0
+			correct = 0
+			total = 0
 
-		for batch in tqdm(test_loader, desc=f'Testing in progress'):
-			batch_X, batch_y, ids = self.batch_to_device_(batch, device)
+			all_preds = []
+			all_labels = []
 
-			logits = self(self.transform_batch(test_dataset, batch_X, ids), ids)
-			preds = logits.argmax(dim=1)
+			for batch in tqdm(test_loader, desc=f'Testing in progress'):
+					batch_X, batch_y, ids = self.batch_to_device_(batch, device)
+					logits = self(self.transform_batch(test_dataset, batch_X, ids), ids)
+					preds = logits.argmax(dim=1)
 
-			correct += (preds == batch_y).sum().item()
-			total += batch_y.size(0)
+					all_preds.append(preds.cpu())
+					all_labels.append(batch_y.cpu())
 
-		return correct / total
+					correct += (preds == batch_y).sum().item()
+					total += batch_y.size(0)
+
+			all_preds = torch.cat(all_preds).numpy()
+			all_labels = torch.cat(all_labels).numpy()
+
+			cm = confusion_matrix(all_labels, all_preds)
+
+			class_names = [test_dataset.genre_encoder.inverse_transform([i])[0] for i in range(test_dataset.num_classes)]
+
+			ep_dir = Path('analysis') / 'model' / 'test' / f'{self.get_idstr(test_dataset)}'
+			ep_dir.mkdir(parents=True, exist_ok=True)
+			plt.figure(figsize=(10, 8))
+			sns.heatmap(cm, annot=True, fmt='d', xticklabels=class_names, yticklabels=class_names, cmap='Blues')
+			plt.title(f'Confusion Matrix')
+			plt.xlabel('Predicted')
+			plt.ylabel('True')
+			plt.tight_layout()
+			plt.savefig(ep_dir / 'confusion_matrix_test.png')
+			plt.close()
+			print(f'\n{cm}')
+
+			precision = precision_score(all_labels, all_preds, average=None)
+			recall = recall_score(all_labels, all_preds, average=None)
+			f1 = f1_score(all_labels, all_preds, average=None)
+
+			macro_precision = precision_score(all_labels, all_preds, average='macro')
+			macro_recall = recall_score(all_labels, all_preds, average='macro')
+			macro_f1 = f1_score(all_labels, all_preds, average='macro')
+
+			logging.info(f'Macro precision: {macro_precision}, Macro recall: {macro_recall}, Macro F1: {macro_f1}')
+
+			logging.info("Per-class metrics:")
+			for i, cls in enumerate(class_names):
+					logging.info(f"{cls}: Precision={precision[i]:.3f}, Recall={recall[i]:.3f}, F1={f1[i]:.3f}")
+			logging.info(f"Macro-Averaged: Precision={macro_precision:.3f}, Recall={macro_recall:.3f}, F1={macro_f1:.3f}")
+
+			x = np.arange(len(class_names))
+			width = 0.25
+
+			plt.figure(figsize=(12, 6))
+			plt.bar(x - width, precision, width, label='Precision')
+			plt.bar(x, recall, width, label='Recall')
+			plt.bar(x + width, f1, width, label='F1')
+			plt.xticks(x, class_names, rotation=45, ha='right')
+			plt.ylim(0, 1)
+			plt.ylabel('Score')
+			plt.title(f'Per-Class Precision/Recall/F1')
+			plt.legend()
+			plt.tight_layout()
+			plt.savefig(ep_dir / 'per_class_metrics.png')
+			plt.close()
+
+			logging.info(f'Testing visuals output to {ep_dir}')
+
+			return correct / total
 
 	@torch.no_grad()
 	def evaluate(
