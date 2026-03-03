@@ -1,9 +1,8 @@
 import argparse
 import logging
-from pathlib import Path
 
-from src.fma import VariableFMADataset
 from src.variants.vggish_model import VGGishFMA
+from src.fma.vgg_dataset import VGGishFrameDataset
 
 # ----------------------------
 # Setup logging
@@ -26,13 +25,13 @@ def main():
     # Load datasets
     # ----------------------------
     logging.info("[DATASET] Loading training dataset")
-    train_ds = VariableFMADataset(split="training")
+    train_ds = VGGishFrameDataset(split="training")
 
     logging.info("[DATASET] Loading validation dataset")
-    val_ds = VariableFMADataset(split="validation", genre_encoder=train_ds.genre_encoder)
+    val_ds = VGGishFrameDataset(split="validation", genre_encoder=train_ds.genre_encoder)
 
     logging.info("[DATASET] Loading test dataset")
-    test_ds = VariableFMADataset(split="test", genre_encoder=train_ds.genre_encoder)
+    test_ds = VGGishFrameDataset(split="test", genre_encoder=train_ds.genre_encoder)
 
     # ----------------------------
     # Instantiate model
