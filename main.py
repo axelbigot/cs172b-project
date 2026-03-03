@@ -100,7 +100,7 @@ if __name__ == '__main__':
             logging.info(f'[MAIN] Testing model {ModelClass.name()} ({ModelClass.__name__})')
             test_ds = DatasetClass(split='test', downsample_frac=frac, genre_encoder=train_ds.genre_encoder)
 
-            ModelClass.test_generic(test_dataset=test_ds)
+            ModelClass.test_generic(test_dataset=test_ds, tag=args.tag)
 
 
     logging.info(f'[MAIN] Graceful end. Goodbye!')

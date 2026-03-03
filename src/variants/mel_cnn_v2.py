@@ -6,12 +6,12 @@ from src.common import AbstractFMAGenreModule
 
 
 def mel_collate(batch: List[Tuple[torch.Tensor, torch.LongTensor, int]]):
-		mels = torch.stack([x for x, _, _ in batch], dim=0)  # shape: (B, 1, n_mels, T)
+		mels = torch.stack([x for x, _, _ in batch], dim=0)
 		labels = torch.stack([y for _, y, _ in batch], dim=0)
 		ids = [i for _, _, i in batch]
 		return mels, labels, ids
 
-class MelCNNFMAModel(AbstractFMAGenreModule):
+class MelCNNFMAModelV2(AbstractFMAGenreModule):
 		@classmethod
 		def collate_fn(cls):
 			return mel_collate
@@ -19,7 +19,7 @@ class MelCNNFMAModel(AbstractFMAGenreModule):
 		@classmethod
 		def train_generic(cls, train_dataset: VariableFMADataset, val_dataset: VariableFMADataset, **kwargs):
 				model = cls(train_dataset.num_classes, **kwargs)
-				model.fma_train(train_dataset, val_dataset, batch_size=16, num_epochs=100)
+				model.fma_train(train_dataset, val_dataset, batch_size=16, num_epochs=1000)
 
 		@classmethod
 		def test_generic(cls, test_dataset: VariableFMADataset, **kwargs):
@@ -29,27 +29,32 @@ class MelCNNFMAModel(AbstractFMAGenreModule):
 
 		@classmethod
 		def name(cls):
-				return 'mel-cnn'
+				return 'mel-cnn-v2'
 
-		def __init__(self, num_classes: int, conv_channels=(32,64,128), **kwargs):
+		def __init__(self, num_classes: int, conv_channels=(64,64,128), **kwargs):
 				super().__init__(**kwargs)
 				layers = []
 				in_ch = 1
 				for out_ch in conv_channels:
 						layers.append(nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1))
-						layers.append(nn.BatchNorm2d(out_ch))
+						layers.append(nn.GroupNorm(num_groups=8, num_channels=out_ch))
 						layers.append(nn.ReLU(inplace=True))
 						layers.append(nn.MaxPool2d((2,2)))
 						in_ch = out_ch
-				layers.append(nn.AdaptiveAvgPool2d((1,None)))
+				layers.append(nn.Conv2d(conv_channels[-1], conv_channels[-1], kernel_size=3, padding=1))
+				layers.append(nn.GroupNorm(num_groups=8, num_channels=conv_channels[-1]))
+				layers.append(nn.ReLU(inplace=True))
 				self.feature_extractor = nn.Sequential(*layers)
-				self.dropout = nn.Dropout(0.3)
+				self.temporal_conv = nn.Conv1d(conv_channels[-1], conv_channels[-1], kernel_size=3, padding=1)
+				self.dropout = nn.Dropout(0.4)
 				self.classifier = nn.Linear(conv_channels[-1], num_classes)
 
 		def forward(self, batch_X: torch.Tensor, ids: List[int] = None) -> torch.Tensor:
 				device = next(self.parameters()).device
 				x = batch_X.to(device)
 				feat = self.feature_extractor(x)
-				feat = feat.mean(dim=3).squeeze(2)
+				feat = feat.mean(dim=2)
+				feat = self.temporal_conv(feat)
+				feat = feat.mean(dim=2)
 				feat = self.dropout(feat)
 				return self.classifier(feat)

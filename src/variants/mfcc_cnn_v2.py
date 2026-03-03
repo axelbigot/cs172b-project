@@ -12,7 +12,7 @@ def mfcc_collate(batch: List[Tuple[torch.Tensor, torch.LongTensor, int]]):
     ids = [i for _, _, i in batch]
     return mfccs, labels, ids
 
-class MFCC_CNNFMAModel(AbstractFMAGenreModule):
+class MFCC_CNNFMAModelV3(AbstractFMAGenreModule):
     @classmethod
     def collate_fn(cls):
         return mfcc_collate
@@ -23,7 +23,7 @@ class MFCC_CNNFMAModel(AbstractFMAGenreModule):
 
         optimizer = torch.optim.Adam(
             model.parameters(), 
-            lr = 1e-3, 
+            lr = 5e-4, 
             weight_decay = 1e-3  
         )
         
@@ -31,7 +31,7 @@ class MFCC_CNNFMAModel(AbstractFMAGenreModule):
             label_smoothing = 0.1 
         )
 
-        model.fma_train(train_dataset, val_dataset, batch_size = 32, num_epochs = 150, optimizer = optimizer, criterion = criterion)
+        model.fma_train(train_dataset, val_dataset, batch_size = 32, num_epochs = 75, optimizer = optimizer, criterion = criterion)
 
     @classmethod
     def test_generic(cls, test_dataset: VariableFMADataset, **kwargs):
@@ -41,9 +41,9 @@ class MFCC_CNNFMAModel(AbstractFMAGenreModule):
 
     @classmethod
     def name(cls):
-        return 'mfcc-cnn'
+        return 'mfcc-cnn-v3'
 
-    def apply_spec_augment(self, x, max_time_mask=35, max_freq_mask=15):
+    def apply_spec_augment(self, x, max_time_mask=50, max_freq_mask=10):
         b, c, f, t = x.shape
 
         # Frequency Masking
@@ -58,7 +58,7 @@ class MFCC_CNNFMAModel(AbstractFMAGenreModule):
         
         return x
 
-    def __init__(self, num_classes: int, conv_channels: tuple[int, ...] = (16, 32, 64, 128), dropout_p: float = 0.5, **kwargs):
+    def __init__(self, num_classes: int, conv_channels: tuple[int, ...] = (32, 64, 128, 256), dropout_p: float = 0.4, **kwargs):
         super().__init__(**kwargs)
 
         layers = []
@@ -70,7 +70,7 @@ class MFCC_CNNFMAModel(AbstractFMAGenreModule):
                 nn.BatchNorm2d(ch),
                 nn.ReLU(inplace=True),
                 nn.MaxPool2d(2),
-                nn.Dropout2d(p=0.1)
+                nn.Dropout2d(p=0.2)
             ]
             input_ch = ch
 

@@ -27,7 +27,7 @@ def audio_genre_collate(batch: List[Tuple[callable, torch.LongTensor, int]]) -> 
 class AbstractFMAGenreModule(nn.Module, ABC):
 	@classmethod
 	@abstractmethod
-	def train_generic(cls, train_dataset: VariableFMADataset, val_dataset: VariableFMADataset, tag: str):
+	def train_generic(cls, train_dataset: VariableFMADataset, val_dataset: VariableFMADataset, **kwargs):
 		"""_summary_ Static method that each FMA model must implement which will be called by the main program.
 		This function should delegate to `fma_train`.
 
@@ -42,7 +42,7 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 	@classmethod
 	@abstractmethod
-	def test_generic(cls: type['AbstractFMAGenreModule'], test_dataset: VariableFMADataset):
+	def test_generic(cls: type['AbstractFMAGenreModule'], test_dataset: VariableFMADataset, **kwargs):
 		"""_summary_ Static method that delegates to the unified testing loop.
 
 		Parameters
@@ -137,12 +137,18 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 		epoch = 0
 
-		path = DATA_DIRECTORY / f'model_trained_{self.name()}{f"_tag-{self.tag}" if len(self.tag) else ""}_{train_dataset.__class__.__name__}_frac-{train_dataset.dowsample_frac}'
-		log_dir = DATA_DIRECTORY / f'runs/{self.name()}'
+		idstr = self.get_idstr(train_dataset)
+		visualizer = TrainingVisualizer(train_dataset, idstr)
+
+		path = DATA_DIRECTORY / idstr
+		log_dir = DATA_DIRECTORY / f'runs/{idstr}'
 
 		log_dir.mkdir(parents=True, exist_ok=True)
 
 		writer = SummaryWriter(log_dir=str(log_dir))
+
+		best_macro_f1 = -float('inf')
+		optimal_path = DATA_DIRECTORY / f'{idstr}-optimal'
 
 		if path.exists():
 			cp = torch.load(path, map_location=device)
@@ -156,6 +162,7 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 						state[k] = v.to(device)
 
 			epoch = cp['epoch']
+			best_macro_f1 = cp.get('best_macro_f1', -float('inf'))
 
 		criterion.to(device)
 		self.to(device)
@@ -174,10 +181,6 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 			shuffle=False,
 			collate_fn=self.collate_fn(),
 		)
-
-		idstr = self.get_idstr(train_dataset)
-		visualizer = TrainingVisualizer(train_dataset, idstr)
-		snapshot_interval = max(1, num_epochs // 10)
 
 		for ep in tqdm(range(epoch, num_epochs), desc='Total Epochs'):
 			epoch = ep
@@ -213,6 +216,18 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 			)
 
 			macro_f1 = f1_score(val_labels.numpy(), val_preds.numpy(), average='macro')
+
+			if macro_f1 > best_macro_f1:
+				best_macro_f1 = macro_f1
+
+				torch.save({
+						'model_state_dict': self.state_dict(),
+						'optimizer_state_dict': optimizer.state_dict(),
+						'epoch': epoch + 1,
+						'best_macro_f1': best_macro_f1
+				}, optimal_path)
+
+				logging.info(f"[CHECKPOINT] New best model saved with val acc {best_macro_f1:.4f}")
 
 			logging.info(
 				f'Epoch {epoch+1}\n'
@@ -251,7 +266,8 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 			torch.save({
 				'model_state_dict': self.state_dict(),
 				'optimizer_state_dict': optimizer.state_dict(),
-				'epoch': epoch+1
+				'epoch': epoch+1,
+				'best_macro_f1': best_macro_f1
 			}, path)
 
 	def fma_test(
@@ -260,7 +276,10 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 		batch_size=16,
 		device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 	) -> float:
-		path = DATA_DIRECTORY / f'model_trained_{self.name()}'
+		path = DATA_DIRECTORY / self.get_idstr(test_dataset)
+		optimal = DATA_DIRECTORY / f'{self.get_idstr(test_dataset)}-optimal'
+		path = optimal if optimal.exists() else path
+
 		if path.exists():
 			cp = torch.load(path, map_location=device)
 			self.load_state_dict(cp['model_state_dict'])
