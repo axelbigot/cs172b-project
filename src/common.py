@@ -5,51 +5,80 @@ import numpy as np
 
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from os import PathLike
-from typing import List, Tuple
-from sklearn.metrics import confusion_matrix, f1_score
 
 from src.constants import *
-from src.fma import VariableFMADataset
-from src.model_analyzer import TrainingVisualizer
+from src.fma import VariableFMADataset, FMATrack
 
 
-def audio_genre_collate(batch: List[Tuple[callable, torch.LongTensor, int]]) -> Tuple[List[callable], torch.LongTensor, List[int]]:
-	load_audios = [load_audio for load_audio, _, _ in batch]
-	labels = torch.stack([genre for _, genre, _ in batch])
-	ids = [i for _, _, i in batch]
+@dataclass
+class FMATrackBatch:
+	"""_summary_ Batched FMATracks.
 
-	return load_audios, labels, ids
+	Note that the `audios` member is a list of variable-length tensors and may need some preprocessing
+	for certain models (in `forward`).
+	"""
+	audios: list[torch.Tensor]
+	lengths: torch.Tensor
+	track_ids: torch.Tensor
+	genres: torch.Tensor
+	features: torch.Tensor
+	echonests: torch.Tensor
+
+def fma_track_collate(batch: list[FMATrack]) -> FMATrackBatch:
+	"""_summary_ Collation function for batching FMATracks.
+
+	Parameters
+	----------
+	batch : list[FMATrack]
+			_description_ Raw FMATracks in the batch.
+
+	Returns
+	-------
+	FMATrackBatch
+			_description_ Batched FMATracks.
+	"""
+	return FMATrackBatch(
+		audios=[torch.tensor(b.audio) for b in batch],
+		lengths=torch.tensor([b.length for b in batch], dtype=torch.float32),
+		track_ids=torch.tensor([b.track_id for b in batch], dtype=torch.int32),
+		genres=torch.tensor([b.genre for b in batch], dtype=torch.long),
+		features=torch.from_numpy(np.stack([b.features for b in batch], axis=0)).float(),
+    echonests=torch.from_numpy(np.stack([b.echonest for b in batch], axis=0)).float()
+	)
 
 class AbstractFMAGenreModule(nn.Module, ABC):
 	@classmethod
 	@abstractmethod
-	def train_generic(cls, train_dataset: VariableFMADataset, val_dataset: VariableFMADataset, **kwargs):
+	def train_generic(cls, train_dataset: Subset, val_dataset: Subset):
 		"""_summary_ Static method that each FMA model must implement which will be called by the main program.
 		This function should delegate to `fma_train`.
 
 		Parameters
 		----------
-		train_dataset : VariableFMADataset
+		train_dataset : Subset
 				_description_ Training dataset (train split)
-		val_dataset : VariableFMADataset
+		val_dataset : Subset
 				_description_ Validation dataset (validation split)
 		"""
 		pass
 
 	@classmethod
-	@abstractmethod
-	def test_generic(cls: type['AbstractFMAGenreModule'], test_dataset: VariableFMADataset, **kwargs):
+	def test_generic(cls: type['AbstractFMAGenreModule'], test_dataset: Subset):
 		"""_summary_ Static method that delegates to the unified testing loop.
 
 		Parameters
 		----------
-		test_dataset : VariableFMADataset
+		test_dataset : Subset
 				_description_ Test dataset (test split of data).
 		"""
+		model = cls()
+		test_accuracy = model.fma_test(test_dataset)
+
+		logging.info(f'Test accuracy: {(test_accuracy * 100):6f}%')
 
 	@classmethod
 	@abstractmethod
@@ -63,23 +92,15 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 				_description_ Display name (ideally short). This value must be unique compared to other models.
 		"""
 		pass
-
-	@classmethod
-	def collate_fn(cls):
-		return audio_genre_collate
-	
-	def __init__(self, tag: str, *args, **kwargs):
-		super().__init__(*args, **kwargs)
-		self.tag = tag
 	
 	@abstractmethod
-	def forward(self, x: List[callable], ids: List[int]) -> torch.Tensor:
+	def forward(self, track: FMATrackBatch) -> torch.Tensor:
 		"""_summary_ Forward method of the model.
 
 		Parameters
 		----------
-		x : List[callable]
-				_description_ returns batched audio byte tensors (variable length).
+		track : FMATrackBatch
+				_description_ Batched FMA tracks.
 
 		Returns
 		-------
@@ -88,32 +109,25 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 		"""
 		pass
 
-	def transform_batch(self, dataset, x, ids):
-		return x
-	
-	def get_idstr(self, dataset: VariableFMADataset):
-		return f'model_trained_{self.name()}{f"_tag-{self.tag}" if len(self.tag) else ""}_{dataset.__class__.__name__}_frac-{dataset.dowsample_frac}'
-
 	def fma_train(
 		self,
-		train_dataset: VariableFMADataset,
-		val_dataset: VariableFMADataset,
+		train_dataset: Subset,
+		val_dataset: Subset,
 		batch_size: int=16,
 		optimizer: torch.optim.Optimizer | None = None,
 		criterion: torch.nn.Module | None = None,
 		lr: float=1e-3,
 		num_epochs: int=10,
-		device: str='cuda' if torch.cuda.is_available() else 'cpu',
-		early_stopping_patience: int | None = None
+		device: str='cuda' if torch.cuda.is_available() else 'cpu'
 	):
 		"""_summary_ Parameterized unified training loop for all models. This function should be invoked by
 		the model's `train_generic`.
 
 		Parameters
 		----------
-		train_dataset : VariableFMADataset
+		train_dataset : Subset
 				_description_, Training dataset (train split)
-		val_dataset : VariableFMADataset
+		val_dataset : Subset
 				_description_, Validation dataset (validation split)
 		batch_size : int, optional
 				_description_, by default 16
@@ -138,20 +152,12 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 		epoch = 0
 
-		idstr = self.get_idstr(train_dataset)
-		visualizer = TrainingVisualizer(train_dataset, idstr)
-
-		path = DATA_DIRECTORY / idstr
-		log_dir = DATA_DIRECTORY / f'runs/{idstr}'
+		path = DATA_DIRECTORY / f'model_trained_{self.name()}'
+		log_dir = DATA_DIRECTORY / f'runs/{self.name()}'
 
 		log_dir.mkdir(parents=True, exist_ok=True)
 
 		writer = SummaryWriter(log_dir=str(log_dir))
-
-		best_macro_f1 = -float('inf')
-		optimal_path = DATA_DIRECTORY / f'{idstr}-optimal'
-
-		no_improve_epochs = 0
 
 		if path.exists():
 			cp = torch.load(path, map_location=device)
@@ -165,7 +171,6 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 						state[k] = v.to(device)
 
 			epoch = cp['epoch']
-			best_macro_f1 = cp.get('best_macro_f1', -float('inf'))
 
 		criterion.to(device)
 		self.to(device)
@@ -175,142 +180,74 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 			train_dataset,
 			batch_size=batch_size,
 			shuffle=True,
-			collate_fn=self.collate_fn(),
+			collate_fn=fma_track_collate
 		)
 
 		val_loader = DataLoader(
 			val_dataset,
 			batch_size=batch_size,
-			shuffle=False,
-			collate_fn=self.collate_fn(),
+			shuffle=True,
+			collate_fn=fma_track_collate
 		)
 
-		for ep in tqdm(range(epoch, num_epochs), desc='Total Epochs'):
+		for ep in range(epoch, num_epochs):
 			epoch = ep
-			train_dataset.set_epoch(epoch)
-			val_dataset.set_epoch(epoch)
 
 			self.train()
 			train_loss = 0.0
 			n_correct = 0
 			total = 0
 
-			for batch in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{num_epochs}', leave=False):
-				batch_X, batch_y, ids = self.batch_to_device_(batch, device)
+			for batch in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{num_epochs}'):
+				batch = self.batch_to_device_(batch, device)
 
 				optimizer.zero_grad()
-				outputs = self(self.transform_batch(train_dataset, batch_X, ids), ids)
-				loss = criterion(outputs, batch_y)
+				outputs = self(batch)
+				loss = criterion(outputs, batch.genres)
 				loss.backward()
 				optimizer.step()
 
-				train_loss += loss.item() * len(batch_y)
+				train_loss += loss.item() * len(batch.track_ids)
 				preds = outputs.argmax(1)
-				n_correct += (preds == batch_y).sum().item()
-				total += len(batch_y)
+				n_correct += (preds == batch.genres).sum().item()
+				total += len(batch.track_ids)
 
 			train_accuracy = n_correct / total
 			train_loss /= total
 
-			val_loss, val_accuracy, val_preds, val_labels = self.evaluate(
-				val_dataset,
-				val_loader,
-				device,
-				criterion,
-				return_preds=True
-			)
-
-			macro_f1 = f1_score(val_labels.numpy(), val_preds.numpy(), average='macro')
-
-			if early_stopping_patience is not None and early_stopping_patience > 0:
-				if macro_f1 > best_macro_f1:
-					no_improve_epochs = 0
-				else:
-					no_improve_epochs += 1
-
-				if no_improve_epochs >= early_stopping_patience:
-					logging.info(f"[EARLY STOPPING] No improvement in {early_stopping_patience} epochs. Stopping training.")
-					break
-
-			if macro_f1 > best_macro_f1:
-				best_macro_f1 = macro_f1
-
-				torch.save({
-						'model_state_dict': self.state_dict(),
-						'optimizer_state_dict': optimizer.state_dict(),
-						'epoch': epoch + 1,
-						'best_macro_f1': best_macro_f1
-				}, optimal_path)
-
-				logging.info(f"[CHECKPOINT] New best model saved with val acc {best_macro_f1:.4f}")
+			val_loss, val_accuracy = self.evaluate(val_loader, device, criterion)
 
 			logging.info(
 				f'Epoch {epoch+1}\n'
 				f'\tTrain loss: {train_loss:6f}, accuracy: {(train_accuracy * 100):6f}%\n'
-				f'\tValidation loss: {val_loss:6f}, accuracy: {(val_accuracy * 100):6f}%\n'
-				f"Validation Macro F1: {macro_f1:.4f}"
+				f'\tValidation loss: {val_loss:6f}, accuracy: {(val_accuracy * 100):6f}%'
 			)
-
-			cm = confusion_matrix(val_labels.numpy(), val_preds.numpy())
-			print(f'\n{cm}')
-
-			per_class_acc = cm.diagonal() / cm.sum(axis=1)
-			for i, acc in enumerate(per_class_acc):
-					class_name = val_dataset.genre_encoder.inverse_transform([i])[0]
-					logging.info(f"Class {class_name}: {acc*100:.2f}%")
-					writer.add_scalar(f'PerClassAcc/{class_name}', acc, ep)
 
 			writer.add_scalar('Loss/Train', train_loss, ep)
 			writer.add_scalar('Accuracy/Train', train_accuracy, ep)
 			writer.add_scalar('Loss/Validation', val_loss, ep)
 			writer.add_scalar('Accuracy/Validation', val_accuracy, ep)
-			writer.add_scalar('F1/Validation', macro_f1, ep)
-
-			visualizer.update(
-				epoch,
-				train_loss=train_loss,
-				train_acc=train_accuracy,
-				val_loss=val_loss,
-				val_acc=val_accuracy,
-				macro_f1=macro_f1,
-				per_class_acc=per_class_acc.tolist(),
-				cm=cm,
-				snapshot=(ep % max(1, num_epochs // 10) == 0)
-			)
 
 			torch.save({
 				'model_state_dict': self.state_dict(),
 				'optimizer_state_dict': optimizer.state_dict(),
-				'epoch': epoch+1,
-				'best_macro_f1': best_macro_f1
+				'epoch': epoch+1
 			}, path)
 
-	@torch.no_grad
 	def fma_test(
 		self, 
-		test_dataset: VariableFMADataset, 
-		batch_size=16,
+		test_dataset: Subset, 
 		device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 	) -> float:
-		path = DATA_DIRECTORY / self.get_idstr(test_dataset)
-		optimal = DATA_DIRECTORY / f'{self.get_idstr(test_dataset)}-optimal'
-		path = optimal if optimal.exists() else path
-
+		path = DATA_DIRECTORY / f'model_trained_{self.name()}'
 		if path.exists():
 			cp = torch.load(path, map_location=device)
 			self.load_state_dict(cp['model_state_dict'])
 
-			ep = cp['epoch']
-			test_dataset.set_epoch(ep)
-			logging.info(f'Loaded optimal version from epoch {ep}')
-		else:
-			logging.warning(f'No model at path {path}, testing is occuring on an essentially empty model (untrained). Check that the model name and tag is correct!')
-
 		test_loader = DataLoader(
 			test_dataset,
-			shuffle=False,
-			batch_size=batch_size,
-			collate_fn=self.collate_fn()
+			shuffle=True,
+			collate_fn=fma_track_collate
 		)
 		
 		self.to(device)
@@ -320,57 +257,51 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 		total = 0
 
 		for batch in tqdm(test_loader, desc=f'Testing in progress'):
-			batch_X, batch_y, ids = self.batch_to_device_(batch, device)
+			batch = self.batch_to_device_(batch, device)
 
-			logits = self(self.transform_batch(test_dataset, batch_X, ids), ids)
+			logits = self(batch)
 			preds = logits.argmax(dim=1)
 
-			correct += (preds == batch_y).sum().item()
-			total += batch_y.size(0)
+			correct += (preds == batch.genres).sum().item()
+			total += batch.genres.size(0)
 
 		return correct / total
 
 	@torch.no_grad()
 	def evaluate(
 		self, 
-		dataset: VariableFMADataset,
 		loader: DataLoader, 
 		device: str, 
-		criterion: nn.Module,
-		return_preds: bool = False
-	):
+		criterion: nn.Module
+	) -> tuple[float, float]:
 		self.eval()
 
 		total_loss = 0.0
 		n_correct = 0
 		total = 0
 
-		all_preds = []
-		all_labels = []
-
 		for batch in loader:
-			batch_X, batch_y, ids = self.batch_to_device_(batch, device)
-			outputs = self(self.transform_batch(dataset, batch_X, ids), ids)
+			batch = self.batch_to_device_(batch, device)
+			outputs = self(batch)
 
-			loss = criterion(outputs, batch_y)
-			total_loss += loss.item() * len(batch_y)
+			loss = criterion(outputs, batch.genres)
+			total_loss += loss.item() * len(batch.track_ids)
 
 			preds = outputs.argmax(dim=1)
-
-			n_correct += (preds == batch_y).sum().item()
-			total += len(batch_y)
-
-			if return_preds:
-				all_preds.append(preds.cpu())
-				all_labels.append(batch_y.cpu())
+			n_correct += (preds == batch.genres).sum().item()
+			total += len(batch.track_ids)
 
 		accuracy = n_correct / total
 		avg_loss = total_loss / total
 
-		if return_preds:
-			return avg_loss, accuracy, torch.cat(all_preds), torch.cat(all_labels)
-
 		return avg_loss, accuracy
 
-	def batch_to_device_(self, batch: Tuple[List[torch.FloatTensor], torch.LongTensor, List[int]], device: str) -> Tuple[List[callable], torch.LongTensor, List[int]]:
-		return (batch[0], batch[1].to(device), batch[2])
+	def batch_to_device_(self, batch: FMATrackBatch, device: str) -> FMATrackBatch:
+		return FMATrackBatch(
+			audios=[a.to(device) for a in batch.audios],
+			lengths=batch.lengths.to(device),
+			track_ids=batch.track_ids.to(device),
+			genres=batch.genres.to(device),
+			features=batch.features.to(device),
+			echonests=batch.echonests.to(device)
+		)
