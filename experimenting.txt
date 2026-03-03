@@ -1,0 +1,1128 @@
+#now doing batching to increase the speed even more
+# import torch
+# import torch.nn as nn
+# import torchaudio
+# from torch.utils.data import DataLoader
+# from torchvggish import vggish
+# from tqdm import tqdm
+# from functools import partial
+
+# from src.common import AbstractFMAGenreModule
+
+# # ----------------------------
+# # Collate function
+# # ----------------------------
+# def collate_fma(batch, device):
+#     """
+#     Calls each SegmentLoader with the device argument to get a tensor.
+#     """
+#     audios = [t[0](device) for t in batch]  # call loader with device
+#     labels = torch.tensor([t[1] for t in batch], dtype=torch.long)
+#     return audios, labels
+
+# # ----------------------------
+# # Model
+# # ----------------------------
+# class VGGishFMA(AbstractFMAGenreModule):
+
+#     MODEL_PATH = "vggish_fma_best.pt"
+
+#     def __init__(self):
+#         super().__init__()
+#         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+#         self.model = vggish().to(self.device)
+
+#         self.classifier = nn.Sequential(
+#             nn.Linear(128, 256),
+#             nn.ReLU(),
+#             nn.Dropout(0.3),
+#             nn.Linear(256, 16)
+#         ).to(self.device)
+
+#         # Precompute transforms once (on CPU)
+#         self.target_sr = 16000
+#         self.resampler = torchaudio.transforms.Resample(22050, self.target_sr)
+#         self.mel_spec = torchaudio.transforms.MelSpectrogram(
+#             sample_rate=self.target_sr,
+#             n_fft=400,
+#             hop_length=160,
+#             n_mels=64
+#         )
+
+#     @staticmethod
+#     def name():
+#         return "vggish"
+
+#     # ----------------------------
+#     # Preprocessing (batched)
+#     # ----------------------------
+#     def waveform_to_examples(self, waveforms: list, srs: list = None):
+#         """
+#         waveforms: list of 1D torch tensors on CPU
+#         srs: list of sample rates for each waveform
+#         Returns: concatenated examples tensor (N, 1, 96, 64) on GPU and list of example counts per waveform
+#         """
+#         if srs is None:
+#             srs = [22050] * len(waveforms)
+
+#         batch_examples = []
+#         batch_sizes = []
+
+#         for waveform, sr in zip(waveforms, srs):
+#             # Resample if needed
+#             if sr != self.target_sr:
+#                 waveform = self.resampler(waveform.unsqueeze(0)).squeeze(0)
+
+#             # Mel spectrogram
+#             mel = self.mel_spec(waveform.unsqueeze(0))  # (1, n_mels, time)
+#             log_mel = torch.log(mel + 1e-6)  # (1, n_mels, time)
+
+#             # Transpose to (time, n_mels)
+#             log_mel = log_mel.squeeze(0).transpose(0, 1)  # (time_frames, 64)
+
+#             # Vectorized sliding windows
+#             frame_size = 96
+#             if log_mel.size(0) < frame_size:
+#                 # Pad short audio
+#                 pad = torch.zeros(frame_size, 64)
+#                 examples = pad.unsqueeze(0)
+#             else:
+#                 # Use unfold for fast slicing
+#                 examples = log_mel.unfold(0, frame_size, frame_size)  # (num_frames, 64, 96)
+#                 examples = examples.permute(0, 2, 1)  # (num_frames, 96, 64)
+
+#             examples = examples.unsqueeze(1)  # (num_frames, 1, 96, 64)
+#             batch_examples.append(examples)
+#             batch_sizes.append(examples.size(0))
+
+#         all_examples = torch.cat(batch_examples, dim=0).to(self.device)
+#         return all_examples, batch_sizes
+
+#     # ----------------------------
+#     # Forward
+#     # ----------------------------
+#     def forward(self, batch):
+#         all_examples, batch_sizes = self.waveform_to_examples(batch)
+
+#         embeddings = self.model(all_examples)
+
+#         all_embeddings = []
+#         start = 0
+#         for size in batch_sizes:
+#             emb = embeddings[start:start + size].mean(dim=0)
+#             all_embeddings.append(emb)
+#             start += size
+
+#         all_embeddings = torch.stack(all_embeddings)
+#         logits = self.classifier(all_embeddings)
+
+#         return logits
+
+#     # ----------------------------
+#     # Training
+#     # ----------------------------
+#     def train_generic(self, train_dataset, val_dataset,
+#                       batch_size=16, epochs=5):
+
+#         device = self.device
+
+#         train_loader = DataLoader(
+#             train_dataset,
+#             batch_size=batch_size,
+#             shuffle=True,
+#             collate_fn=partial(collate_fma, device=device),
+#             num_workers=4,
+#             pin_memory=True
+#         )
+
+#         val_loader = DataLoader(
+#             val_dataset,
+#             batch_size=batch_size,
+#             collate_fn=partial(collate_fma, device=device),
+#             num_workers=4,
+#             pin_memory=True
+#         )
+
+#         optimizer = torch.optim.Adam([
+#             {"params": self.model.parameters(), "lr": 1e-5},
+#             {"params": self.classifier.parameters(), "lr": 1e-3}
+#         ])
+
+#         criterion = nn.CrossEntropyLoss()
+#         best_val_acc = 0.0
+
+#         for epoch in range(epochs):
+
+#             self.train()
+#             running_loss = 0.0
+
+#             for audios, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False):
+
+#                 labels = labels.to(device)
+
+#                 optimizer.zero_grad()
+#                 logits = self.forward(audios)
+#                 loss = criterion(logits, labels)
+#                 loss.backward()
+#                 optimizer.step()
+
+#                 running_loss += loss.item()
+
+#             avg_loss = running_loss / len(train_loader)
+
+#             # ---- Validation ----
+#             self.eval()
+#             correct, total = 0, 0
+
+#             with torch.no_grad():
+#                 for audios, labels in val_loader:
+#                     labels = labels.to(device)
+#                     logits = self.forward(audios)
+#                     preds = logits.argmax(dim=1)
+
+#                     correct += (preds == labels).sum().item()
+#                     total += len(labels)
+
+#             val_acc = correct / total
+#             print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f}")
+
+#             if val_acc > best_val_acc:
+#                 best_val_acc = val_acc
+#                 torch.save(self.state_dict(), self.MODEL_PATH)
+#                 print("New best model saved.")
+
+#         print("Training complete.")
+
+#     # ----------------------------
+#     # Testing
+#     # ----------------------------
+#     def test_generic(self, test_dataset, batch_size=16):
+
+#         device = self.device
+#         self.load_state_dict(torch.load(self.MODEL_PATH, map_location=device))
+#         self.eval()
+
+#         test_loader = DataLoader(
+#             test_dataset,
+#             batch_size=batch_size,
+#             collate_fn=partial(collate_fma, device=device),
+#             num_workers=4,
+#             pin_memory=True
+#         )
+
+#         correct, total = 0, 0
+
+#         with torch.no_grad():
+#             for audios, labels in tqdm(test_loader, desc="Testing"):
+#                 labels = labels.to(device)
+#                 logits = self.forward(audios)
+#                 preds = logits.argmax(dim=1)
+
+#                 correct += (preds == labels).sum().item()
+#                 total += len(labels)
+
+#         print(f"Test accuracy: {correct / total:.4f}")
+
+#now doing the transforms all at once to increase speed:
+# import torch
+# import torch.nn as nn
+# import torchaudio
+# from torch.utils.data import DataLoader
+# from torchvggish import vggish
+# from tqdm import tqdm
+# from functools import partial
+
+# from src.common import AbstractFMAGenreModule
+
+
+# # ----------------------------
+# # Collate function
+# # ----------------------------
+# def collate_fma(batch, device):
+#     audios = [t[0](device) for t in batch]
+#     labels = torch.tensor([t[1] for t in batch], dtype=torch.long)
+#     return audios, labels
+
+
+# # ----------------------------
+# # Model
+# # ----------------------------
+# class VGGishFMA(AbstractFMAGenreModule):
+
+#     MODEL_PATH = "vggish_fma_best.pt"
+
+#     def __init__(self):
+#         super().__init__()
+#         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+#         self.model = vggish().to(self.device)
+
+#         self.classifier = nn.Sequential(
+#             nn.Linear(128, 256),
+#             nn.ReLU(),
+#             nn.Dropout(0.3),
+#             nn.Linear(256, 16)
+#         ).to(self.device)
+
+#         # 🔥 Create transforms ONCE (big speed improvement)
+#         self.target_sr = 16000
+
+#         self.resampler = torchaudio.transforms.Resample(
+#             22050, self.target_sr
+#         ).to(self.device)
+
+#         self.mel_spec = torchaudio.transforms.MelSpectrogram(
+#             sample_rate=self.target_sr,
+#             n_fft=400,
+#             hop_length=160,
+#             n_mels=64
+#         ).to(self.device)
+
+#     @staticmethod
+#     def name():
+#         return "vggish"
+
+#     # ----------------------------
+#     # Preprocessing (now class method)
+#     # ----------------------------
+#     def waveform_to_examples(self, waveform: torch.Tensor, sr: int = 22050):
+#         device = waveform.device
+#         frame_size = 96
+
+#         if sr != self.target_sr:
+#             waveform = self.resampler(waveform.unsqueeze(0)).squeeze(0)
+
+#         mel = self.mel_spec(waveform.unsqueeze(0))
+#         log_mel = torch.log(mel + 1e-6).transpose(1, 2)
+
+#         examples = []
+
+#         for start in range(0, log_mel.size(1) - frame_size + 1, frame_size):
+#             examples.append(log_mel[:, start:start + frame_size, :])
+
+#         if not examples:
+#             pad = torch.zeros(1, frame_size, 64, device=device)
+#             examples = [pad]
+
+#         examples_tensor = torch.cat(examples, dim=0)
+#         examples_tensor = examples_tensor.unsqueeze(1)
+
+#         return examples_tensor
+
+#     # ----------------------------
+#     # Forward
+#     # ----------------------------
+#     def forward(self, batch):
+#         device = self.device
+
+#         all_embeddings = []
+#         batch_sizes = []
+#         examples_list = []
+
+#         for audio in batch:
+#             audio = audio.float().to(device)
+#             examples = self.waveform_to_examples(audio)
+#             examples_list.append(examples)
+#             batch_sizes.append(examples.size(0))
+
+#         all_examples = torch.cat(examples_list, dim=0)
+
+#         embeddings = self.model(all_examples)
+
+#         start = 0
+#         for size in batch_sizes:
+#             emb = embeddings[start:start + size].mean(dim=0)
+#             all_embeddings.append(emb)
+#             start += size
+
+#         all_embeddings = torch.stack(all_embeddings)
+#         logits = self.classifier(all_embeddings)
+
+#         return logits
+
+#     # ----------------------------
+#     # Training
+#     # ----------------------------
+#     def train_generic(self, train_dataset, val_dataset,
+#                       batch_size=16, epochs=5):
+
+#         device = self.device
+
+#         train_loader = DataLoader(
+#             train_dataset,
+#             batch_size=batch_size,
+#             shuffle=True,
+#             collate_fn=partial(collate_fma, device=device),
+#             num_workers=0
+#         )
+
+#         val_loader = DataLoader(
+#             val_dataset,
+#             batch_size=batch_size,
+#             collate_fn=partial(collate_fma, device=device),
+#             num_workers=0
+#         )
+
+#         optimizer = torch.optim.Adam([
+#             {"params": self.model.parameters(), "lr": 1e-5},
+#             {"params": self.classifier.parameters(), "lr": 1e-3}
+#         ])
+
+#         criterion = nn.CrossEntropyLoss()
+#         best_val_acc = 0.0
+
+#         for epoch in range(epochs):
+
+#             self.train()
+#             running_loss = 0.0
+
+#             for audios, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False):
+
+#                 labels = labels.to(device)
+
+#                 optimizer.zero_grad()
+#                 logits = self.forward(audios)
+#                 loss = criterion(logits, labels)
+#                 loss.backward()
+#                 optimizer.step()
+
+#                 running_loss += loss.item()
+
+#             avg_loss = running_loss / len(train_loader)
+
+#             # ---- Validation ----
+#             self.eval()
+#             correct, total = 0, 0
+
+#             with torch.no_grad():
+#                 for audios, labels in val_loader:
+#                     labels = labels.to(device)
+#                     logits = self.forward(audios)
+#                     preds = logits.argmax(dim=1)
+
+#                     correct += (preds == labels).sum().item()
+#                     total += len(labels)
+
+#             val_acc = correct / total
+#             print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f}")
+
+#             if val_acc > best_val_acc:
+#                 best_val_acc = val_acc
+#                 torch.save(self.state_dict(), self.MODEL_PATH)
+#                 print("New best model saved.")
+
+#         print("Training complete.")
+
+#     # ----------------------------
+#     # Testing
+#     # ----------------------------
+#     def test_generic(self, test_dataset, batch_size=16):
+
+#         device = self.device
+#         self.load_state_dict(torch.load(self.MODEL_PATH, map_location=device))
+#         self.eval()
+
+#         test_loader = DataLoader(
+#             test_dataset,
+#             batch_size=batch_size,
+#             collate_fn=partial(collate_fma, device=device),
+#             num_workers=0
+#         )
+
+#         correct, total = 0, 0
+
+#         with torch.no_grad():
+#             for audios, labels in tqdm(test_loader, desc="Testing"):
+#                 labels = labels.to(device)
+#                 logits = self.forward(audios)
+#                 preds = logits.argmax(dim=1)
+
+#                 correct += (preds == labels).sum().item()
+#                 total += len(labels)
+
+#         print(f"Test accuracy: {correct / total:.4f}")
+
+#attempt at fine tuning no caching with raw
+# src/variants/vggish_model_finetune.py
+
+# import torch
+# import torch.nn as nn
+# import torchaudio
+# from torch.utils.data import DataLoader
+# from torchvggish import vggish
+# from tqdm import tqdm
+# from functools import partial
+
+# from src.common import AbstractFMAGenreModule
+
+
+# # ----------------------------
+# # Collate function
+# # ----------------------------
+# def collate_fma(batch, device):
+#     audios = [t[0](device) for t in batch]
+#     labels = torch.tensor([t[1] for t in batch], dtype=torch.long)
+#     return audios, labels
+
+
+# # ----------------------------
+# # Preprocessing
+# # ----------------------------
+# def waveform_to_examples(waveform: torch.Tensor, sr: int = 22050):
+#     device = waveform.device
+#     target_sr = 16000
+
+#     if sr != target_sr:
+#         resampler = torchaudio.transforms.Resample(sr, target_sr).to(device)
+#         waveform = resampler(waveform.unsqueeze(0)).squeeze(0)
+
+#     mel_spec = torchaudio.transforms.MelSpectrogram(
+#         sample_rate=target_sr,
+#         n_fft=400,
+#         hop_length=160,
+#         n_mels=64
+#     ).to(device)
+
+#     mel = mel_spec(waveform.unsqueeze(0))
+#     log_mel = torch.log(mel + 1e-6).transpose(1, 2)
+
+#     frame_size = 96
+#     examples = []
+
+#     for start in range(0, log_mel.size(1) - frame_size + 1, frame_size):
+#         examples.append(log_mel[:, start:start + frame_size, :])
+
+#     if not examples:
+#         pad = torch.zeros(1, frame_size, 64, device=device)
+#         examples = [pad]
+
+#     examples_tensor = torch.cat(examples, dim=0)
+#     examples_tensor = examples_tensor.unsqueeze(1)
+#     return examples_tensor
+
+
+# # ----------------------------
+# # Model
+# # ----------------------------
+# class VGGishFMA(AbstractFMAGenreModule):
+
+#     MODEL_PATH = "vggish_fma_best.pt"
+
+#     def __init__(self):
+#         super().__init__()
+#         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+#         self.model = vggish().to(self.device)
+
+#         # Stronger classifier head
+#         self.classifier = nn.Sequential(
+#             nn.Linear(128, 256),
+#             nn.ReLU(),
+#             nn.Dropout(0.3),
+#             nn.Linear(256, 16)
+#         ).to(self.device)
+
+#     @staticmethod
+#     def name():
+#         return "vggish"
+
+#     def forward(self, batch):
+#         device = self.device
+
+#         all_embeddings = []
+#         batch_sizes = []
+#         examples_list = []
+
+#         for audio in batch:
+#             audio = audio.float().to(device)
+#             examples = waveform_to_examples(audio)
+#             examples_list.append(examples)
+#             batch_sizes.append(examples.size(0))
+
+#         all_examples = torch.cat(examples_list, dim=0)
+
+#         #fine-tuning (no torch.no_grad)
+#         embeddings = self.model(all_examples)
+
+#         start = 0
+#         for size in batch_sizes:
+#             emb = embeddings[start:start + size].mean(dim=0)
+#             all_embeddings.append(emb)
+#             start += size
+
+#         all_embeddings = torch.stack(all_embeddings)
+#         logits = self.classifier(all_embeddings)
+#         return logits
+
+#     # ----------------------------
+#     # Training
+#     # ----------------------------
+#     def train_generic(self, train_dataset, val_dataset,
+#                       batch_size=16, epochs=10):
+
+#         device = self.device
+
+#         train_loader = DataLoader(
+#             train_dataset,
+#             batch_size=batch_size,
+#             shuffle=True,
+#             collate_fn=partial(collate_fma, device=device),
+#             num_workers=0
+#         )
+
+#         val_loader = DataLoader(
+#             val_dataset,
+#             batch_size=batch_size,
+#             collate_fn=partial(collate_fma, device=device),
+#             num_workers=0
+#         )
+
+#         #Different learning rates
+#         optimizer = torch.optim.Adam([
+#             {"params": self.model.parameters(), "lr": 1e-5},
+#             {"params": self.classifier.parameters(), "lr": 1e-3}
+#         ])
+
+#         criterion = nn.CrossEntropyLoss()
+#         best_val_acc = 0.0
+
+#         for epoch in range(epochs):
+
+#             self.train()
+#             running_loss = 0.0
+
+#             for audios, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False):
+
+#                 labels = labels.to(device)
+
+#                 optimizer.zero_grad()
+#                 logits = self.forward(audios)
+#                 loss = criterion(logits, labels)
+#                 loss.backward()
+#                 optimizer.step()
+
+#                 running_loss += loss.item()
+
+#             avg_loss = running_loss / len(train_loader)
+
+#             # ---- Validation ----
+#             self.eval()
+#             correct, total = 0, 0
+
+#             with torch.no_grad():
+#                 for audios, labels in val_loader:
+#                     labels = labels.to(device)
+#                     logits = self.forward(audios)
+#                     preds = logits.argmax(dim=1)
+
+#                     correct += (preds == labels).sum().item()
+#                     total += len(labels)
+
+#             val_acc = correct / total
+#             print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f}")
+
+#             if val_acc > best_val_acc:
+#                 best_val_acc = val_acc
+#                 torch.save(self.state_dict(), self.MODEL_PATH)
+#                 print("New best model saved.")
+
+#         print("Training complete.")
+
+#     # ----------------------------
+#     # Testing
+#     # ----------------------------
+#     def test_generic(self, test_dataset, batch_size=16):
+
+#         device = self.device
+#         self.load_state_dict(torch.load(self.MODEL_PATH, map_location=device))
+#         self.eval()
+
+#         test_loader = DataLoader(
+#             test_dataset,
+#             batch_size=batch_size,
+#             collate_fn=partial(collate_fma, device=device),
+#             num_workers=0
+#         )
+
+#         correct, total = 0, 0
+
+#         with torch.no_grad():
+#             for audios, labels in tqdm(test_loader, desc="Testing"):
+#                 labels = labels.to(device)
+#                 logits = self.forward(audios)
+#                 preds = logits.argmax(dim=1)
+
+#                 correct += (preds == labels).sum().item()
+#                 total += len(labels)
+
+#         print(f"Test accuracy: {correct / total:.4f}")
+
+
+#attempt at fine tuning but caching is a problem
+# # src/variants/vggish_model_finetune_cached.py
+# import os
+# import torch
+# import torch.nn as nn
+# import torchaudio
+# from torch.utils.data import DataLoader, TensorDataset
+# from torchvggish import vggish
+# from tqdm import tqdm
+# from functools import partial
+
+# from src.common import AbstractFMAGenreModule
+# from src.fma.fma_dataset import VariableFMADataset, FMATrack
+# from src.fma.datased_fused_dataset import DatasedFusedMixin
+
+# # ----------------------------
+# # Top-level collate function
+# # ----------------------------
+# def collate_fma(batch, device):
+#     """
+#     Collate function for FMA datasets.
+#     Returns:
+#         audios: list of 1D tensors
+#         labels: tensor of genre labels
+#     """
+#     audios = [t[0](device) for t in batch]
+#     labels = torch.tensor([t[1] for t in batch], dtype=torch.long)
+#     return audios, labels
+
+# # ----------------------------
+# # Precompute spectrogram for caching
+# # ----------------------------
+# def waveform_to_mel_cache(waveform: torch.Tensor, sr: int = 22050):
+#     """
+#     Converts waveform to log-mel spectrogram [num_frames, 1, 96, 64]
+#     for caching and faster training.
+#     """
+#     device = waveform.device
+#     target_sr = 16000
+#     if sr != target_sr:
+#         resampler = torchaudio.transforms.Resample(sr, target_sr).to(device)
+#         waveform = resampler(waveform.unsqueeze(0)).squeeze(0)
+
+#     mel_spec = torchaudio.transforms.MelSpectrogram(
+#         sample_rate=target_sr, n_fft=400, hop_length=160, n_mels=64
+#     ).to(device)
+
+#     mel = mel_spec(waveform.unsqueeze(0))
+#     log_mel = torch.log(mel + 1e-6).transpose(1, 2)
+
+#     frame_size = 96
+#     examples = []
+#     for start in range(0, log_mel.size(1) - frame_size + 1, frame_size):
+#         examples.append(log_mel[:, start:start + frame_size, :])
+
+#     if not examples:
+#         pad = torch.zeros(1, frame_size, 64, device=device)
+#         examples = [pad]
+
+#     examples_tensor = torch.cat(examples, dim=0).unsqueeze(1)
+#     return examples_tensor
+
+# # ----------------------------
+# # VGGish model with fine-tuning and cached embeddings
+# # ----------------------------
+# class VGGishFMA(AbstractFMAGenreModule):
+
+#     MODEL_PATH = "vggish_fma_best.pt"
+#     CACHE_DIR = "cached_embeddings"
+
+#     def __init__(self, fine_tune=False):
+#         super().__init__()
+#         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+#         self.fine_tune = fine_tune  # 🔹 Fine-tuning flag
+
+#         self.model = vggish()
+#         if not self.fine_tune:
+#             self.model.eval()  # freeze feature extractor
+#         self.model.to(self.device)
+
+#         self.classifier = nn.Linear(128, 16)
+#         self.classifier.to(self.device)
+
+#     @staticmethod
+#     def name():
+#         return "vggish"
+
+#     # ----------------------------
+#     # Cache embeddings for fast training
+#     # ----------------------------
+#     def _cache_embeddings(self, dataset, split_name="train"):
+#         os.makedirs(self.CACHE_DIR, exist_ok=True)
+#         cache_path = os.path.join(self.CACHE_DIR, f"{split_name}_embeddings.pt")
+#         if os.path.exists(cache_path):
+#             return torch.load(cache_path)
+
+#         loader = DataLoader(
+#             dataset,
+#             batch_size=16,
+#             collate_fn=partial(collate_fma, device=self.device),
+#             num_workers=0
+#         )
+
+#         all_embeddings, all_labels = [], []
+#         for audios, labels in tqdm(loader, desc=f"Caching {split_name} embeddings"):
+#             batch_embeds = []
+#             for audio in audios:
+#                 audio = audio.to(self.device).float()
+#                 # 🔹 Precompute log-mel spectrogram
+#                 mel_examples = waveform_to_mel_cache(audio)
+#                 # 🔹 Forward through VGGish
+#                 with torch.no_grad() if not self.fine_tune else torch.enable_grad():
+#                     emb = self.model(mel_examples).mean(dim=0)
+#                 batch_embeds.append(emb)
+#             all_embeddings.append(torch.stack(batch_embeds))
+#             all_labels.append(labels)
+
+#         embeddings = torch.cat(all_embeddings)
+#         labels = torch.cat(all_labels)
+#         torch.save({"embeddings": embeddings, "labels": labels}, cache_path)
+#         return {"embeddings": embeddings, "labels": labels}
+
+#     # ----------------------------
+#     # Forward method
+#     # ----------------------------
+#     def forward(self, batch):
+#         device = self.device
+#         all_embeddings = []
+#         batch_sizes = []
+#         examples_list = []
+
+#         for audio in batch:
+#             audio = audio.float().to(device)
+#             examples = waveform_to_mel_cache(audio)
+#             examples_list.append(examples)
+#             batch_sizes.append(examples.size(0))
+
+#         all_examples = torch.cat(examples_list, dim=0)
+
+#         # 🔹 Fine-tuning: enable grad if needed
+#         if self.fine_tune:
+#             embeddings = self.model(all_examples)
+#         else:
+#             with torch.no_grad():
+#                 embeddings = self.model(all_examples)
+
+#         start = 0
+#         for size in batch_sizes:
+#             emb = embeddings[start:start + size].mean(dim=0)
+#             all_embeddings.append(emb)
+#             start += size
+
+#         all_embeddings = torch.stack(all_embeddings)
+#         logits = self.classifier(all_embeddings)
+#         return logits
+
+#     # ----------------------------
+#     # Training loop
+#     # ----------------------------
+#     def train_generic(self, train_dataset, val_dataset, batch_size=32, epochs=1000, lr=1e-3):
+#         device = self.device
+
+#         # 🔹 Cache embeddings first
+#         train_data = self._cache_embeddings(train_dataset, "train")
+#         val_data = self._cache_embeddings(val_dataset, "val")
+
+#         X_train, y_train = train_data["embeddings"].to(device), train_data["labels"].to(device)
+#         X_val, y_val = val_data["embeddings"].to(device), val_data["labels"].to(device)
+
+#         optimizer_params = list(self.classifier.parameters())
+#         if self.fine_tune:
+#             optimizer_params += list(self.model.parameters())
+#         optimizer = torch.optim.Adam(optimizer_params, lr=lr)
+#         criterion = nn.CrossEntropyLoss()
+#         best_val_acc = 0.0
+
+#         train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=batch_size, shuffle=True)
+#         val_loader = DataLoader(TensorDataset(X_val, y_val), batch_size=batch_size)
+
+#         for epoch in range(epochs):
+#             self.train() if self.fine_tune else self.classifier.train()
+#             running_loss = 0.0
+#             for xb, yb in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False):
+#                 xb, yb = xb.to(device), yb.to(device)
+#                 optimizer.zero_grad()
+#                 logits = self.classifier(xb)
+#                 loss = criterion(logits, yb)
+#                 loss.backward()
+#                 optimizer.step()
+#                 running_loss += loss.item()
+
+#             avg_loss = running_loss / len(train_loader)
+
+#             self.eval()
+#             val_correct, val_total = 0, 0
+#             with torch.no_grad():
+#                 for xb, yb in val_loader:
+#                     xb, yb = xb.to(device), yb.to(device)
+#                     preds = self.classifier(xb).argmax(dim=1)
+#                     val_correct += (preds == yb).sum().item()
+#                     val_total += len(yb)
+#             val_acc = val_correct / val_total
+#             print(f"Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f}")
+
+#             if val_acc > best_val_acc:
+#                 best_val_acc = val_acc
+#                 torch.save(self.state_dict(), self.MODEL_PATH)
+#                 print(f"New best model saved (val_acc={val_acc:.4f})")
+
+#         print("Training complete.")
+
+#     # ----------------------------
+#     # Testing loop
+#     # ----------------------------
+#     def test_generic(self, test_dataset, batch_size=32):
+#         device = self.device
+#         self.load_state_dict(torch.load(self.MODEL_PATH, map_location=device))
+#         self.eval()
+#         print("Loaded trained model.")
+
+#         test_data = self._cache_embeddings(test_dataset, "test")
+#         X_test, y_test = test_data["embeddings"].to(device), test_data["labels"].to(device)
+#         test_loader = DataLoader(TensorDataset(X_test, y_test), batch_size=batch_size)
+
+#         correct, total = 0, 0
+#         with torch.no_grad():
+#             for xb, yb in tqdm(test_loader, desc="Testing"):
+#                 xb, yb = xb.to(device), yb.to(device)
+#                 preds = self.classifier(xb).argmax(dim=1)
+#                 correct += (preds == yb).sum().item()
+#                 total += len(yb)
+
+#         print(f"Test accuracy: {correct / total:.4f}")
+
+#First time trying vggish
+# # src/variants/vggish_model.py
+# import os
+# import torch
+# import torch.nn as nn
+# import torchaudio
+# from torch.utils.data import DataLoader, TensorDataset
+# from torchvggish import vggish
+# from tqdm import tqdm
+# from functools import partial
+
+# # Fixed imports for your project
+# from src.common import AbstractFMAGenreModule
+# from src.fma.fma_dataset import VariableFMADataset, FMATrack
+# from src.fma.datased_fused_dataset import DatasedFusedMixin
+# from src.fma.dataset_analyzer import compare_splits
+
+# # ----------------------------
+# # Top-level collate function
+# # ----------------------------
+# def collate_fma(batch, device):
+#     """
+#     Collate function for FMA datasets.
+#     Args:
+#         batch: list of (SegmentLoader, label) tuples
+#         device: torch device for loading audio
+#     Returns:
+#         audios: list of 1D torch tensors (variable lengths)
+#         labels: torch tensor of genre labels
+#     """
+#     audios = [t[0](device) for t in batch]  # call SegmentLoader with device
+#     labels = torch.tensor([t[1] for t in batch], dtype=torch.long)
+#     return audios, labels
+
+# # ----------------------------
+# # Preprocessing for the Tensors
+# # ----------------------------
+# def waveform_to_examples_tensor(waveform: torch.Tensor, sr: int = 22050):
+#     """
+#     Converts 1D waveform tensor to VGGish examples tensor.
+#     Returns: [num_examples, 1, 96, 64]
+#     """
+#     device = waveform.device
+#     target_sr = 16000
+
+#     if sr != target_sr:
+#         resampler = torchaudio.transforms.Resample(sr, target_sr).to(device)
+#         waveform = resampler(waveform.unsqueeze(0)).squeeze(0)
+
+#     mel_spec = torchaudio.transforms.MelSpectrogram(
+#         sample_rate=target_sr,
+#         n_fft=400,
+#         hop_length=160,
+#         n_mels=64
+#     ).to(device)
+
+#     mel = mel_spec(waveform.unsqueeze(0))
+#     log_mel = torch.log(mel + 1e-6).transpose(1, 2)
+
+#     frame_size = 96
+#     examples = []
+
+#     for start in range(0, log_mel.size(1) - frame_size + 1, frame_size):
+#         examples.append(log_mel[:, start:start + frame_size, :])
+
+#     if not examples:
+#         pad = torch.zeros(1, frame_size, 64, device=device)
+#         examples = [pad]
+
+#     examples_tensor = torch.cat(examples, dim=0)
+#     examples_tensor = examples_tensor.unsqueeze(1)
+#     return examples_tensor
+
+# # ----------------------------
+# # VGG model for FMA
+# # ----------------------------
+# class VGGishFMA(AbstractFMAGenreModule):
+
+#     MODEL_PATH = "vggish_fma_best.pt"
+#     CACHE_DIR = "cached_embeddings"
+
+#     def __init__(self):
+#         super().__init__()
+#         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+#         self.model = vggish()
+#         self.model.eval()  # frozen feature extractor
+#         self.model.to(self.device)
+
+#         self.classifier = nn.Linear(128, 16)
+#         self.classifier.to(self.device)
+
+#     @staticmethod
+#     def name():
+#         return "vggish"
+
+#     def forward(self, batch):
+#         device = self.device
+#         all_embeddings = []
+#         batch_sizes = []
+#         examples_list = []
+
+#         for audio in batch:
+#             audio = audio.float().to(device)
+#             examples = waveform_to_examples_tensor(audio, sr=22050).to(device)
+#             examples_list.append(examples)
+#             batch_sizes.append(examples.size(0))
+
+#         all_examples = torch.cat(examples_list, dim=0)
+
+#         with torch.no_grad():
+#             embeddings = self.model(all_examples)
+
+#         start = 0
+#         for size in batch_sizes:
+#             emb = embeddings[start:start + size].mean(dim=0)
+#             all_embeddings.append(emb)
+#             start += size
+
+#         all_embeddings = torch.stack(all_embeddings)
+#         logits = self.classifier(all_embeddings)
+#         return logits
+
+#     # ----------------------------
+#     # Helper: Cache embeddings
+#     # ----------------------------
+#     def _cache_embeddings(self, dataset, split_name="train"):
+#         os.makedirs(self.CACHE_DIR, exist_ok=True)
+#         cache_path = os.path.join(self.CACHE_DIR, f"{split_name}_embeddings.pt")
+#         if os.path.exists(cache_path):
+#             return torch.load(cache_path)
+
+#         loader = DataLoader(
+#             dataset,
+#             batch_size=16,
+#             collate_fn=partial(collate_fma, device=self.device),  # pickleable on Windows
+#             num_workers=0  # safe default for Windows; increase later if needed
+#         )
+
+#         all_embeddings, all_labels = [], []
+
+#         with torch.no_grad():
+#             for audios, labels in tqdm(loader, desc=f"Caching {split_name} embeddings"):
+#                 batch_embeds = []
+#                 for audio in audios:
+#                     audio = audio.to(self.device).float()
+#                     examples = waveform_to_examples_tensor(audio).to(self.device)
+#                     emb = self.model(examples).mean(dim=0)  # average over examples
+#                     batch_embeds.append(emb)
+#                 all_embeddings.append(torch.stack(batch_embeds))
+#                 all_labels.append(labels)
+
+#         embeddings = torch.cat(all_embeddings)
+#         labels = torch.cat(all_labels)
+#         torch.save({"embeddings": embeddings, "labels": labels}, cache_path)
+#         return {"embeddings": embeddings, "labels": labels}
+
+#     # ----------------------------
+#     # Training Loop
+#     # ----------------------------
+#     def train_generic(self, train_dataset, val_dataset, batch_size=32, epochs=1000):
+#         device = self.device
+
+#         # cache embeddings
+#         train_data = self._cache_embeddings(train_dataset, "train")
+#         val_data = self._cache_embeddings(val_dataset, "val")
+#         X_train, y_train = train_data["embeddings"].to(device), train_data["labels"].to(device)
+#         X_val, y_val = val_data["embeddings"].to(device), val_data["labels"].to(device)
+
+#         optimizer = torch.optim.Adam(self.classifier.parameters(), lr=1e-3)
+#         criterion = nn.CrossEntropyLoss()
+#         best_val_acc = 0.0
+
+#         train_tensor = TensorDataset(X_train, y_train)
+#         val_tensor = TensorDataset(X_val, y_val)
+#         train_loader = DataLoader(train_tensor, batch_size=batch_size, shuffle=True)
+#         val_loader = DataLoader(val_tensor, batch_size=batch_size)
+
+#         for epoch in range(epochs):
+#             self.classifier.train()
+#             running_loss = 0.0
+#             for xb, yb in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False):
+#                 xb, yb = xb.to(device), yb.to(device)
+#                 optimizer.zero_grad()
+#                 logits = self.classifier(xb)
+#                 loss = criterion(logits, yb)
+#                 loss.backward()
+#                 optimizer.step()
+#                 running_loss += loss.item()
+
+#             avg_loss = running_loss / len(train_loader)
+#             self.classifier.eval()
+#             val_correct = 0
+#             val_total = 0
+#             with torch.no_grad():
+#                 for xb, yb in val_loader:
+#                     xb, yb = xb.to(device), yb.to(device)
+#                     preds = self.classifier(xb).argmax(dim=1)
+#                     val_correct += (preds == yb).sum().item()
+#                     val_total += len(yb)
+#             val_acc = val_correct / val_total
+#             print(f"Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f}")
+
+#             if val_acc > best_val_acc:
+#                 best_val_acc = val_acc
+#                 torch.save(self.state_dict(), self.MODEL_PATH)
+#                 print(f"New best model saved (val_acc={val_acc:.4f})")
+
+#         print("Training complete.")
+
+#     # ----------------------------
+#     # Testing Loop
+#     # ----------------------------
+#     def test_generic(self, test_dataset, batch_size=32):
+#         device = self.device
+#         self.load_state_dict(torch.load(self.MODEL_PATH, map_location=device))
+#         self.classifier.eval()
+#         print("Loaded trained model.")
+
+#         test_data = self._cache_embeddings(test_dataset, "test")
+#         X_test, y_test = test_data["embeddings"].to(device), test_data["labels"].to(device)
+#         test_tensor = TensorDataset(X_test, y_test)
+#         test_loader = DataLoader(test_tensor, batch_size=batch_size)
+
+#         correct, total = 0, 0
+#         with torch.no_grad():
+#             for xb, yb in tqdm(test_loader, desc="Testing"):
+#                 xb, yb = xb.to(device), yb.to(device)
+#                 preds = self.classifier(xb).argmax(dim=1)
+#                 correct += (preds == yb).sum().item()
+#                 total += len(yb)
+
+#         print(f"Test accuracy: {correct / total:.4f}")
