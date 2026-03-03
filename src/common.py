@@ -103,7 +103,8 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 		criterion: torch.nn.Module | None = None,
 		lr: float=1e-3,
 		num_epochs: int=10,
-		device: str='cuda' if torch.cuda.is_available() else 'cpu'
+		device: str='cuda' if torch.cuda.is_available() else 'cpu',
+		early_stopping_patience: int | None = None
 	):
 		"""_summary_ Parameterized unified training loop for all models. This function should be invoked by
 		the model's `train_generic`.
@@ -149,6 +150,8 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 		best_macro_f1 = -float('inf')
 		optimal_path = DATA_DIRECTORY / f'{idstr}-optimal'
+
+		no_improve_epochs = 0
 
 		if path.exists():
 			cp = torch.load(path, map_location=device)
@@ -219,6 +222,16 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 
 			macro_f1 = f1_score(val_labels.numpy(), val_preds.numpy(), average='macro')
 
+			if early_stopping_patience is not None and early_stopping_patience > 0:
+				if macro_f1 > best_macro_f1:
+					no_improve_epochs = 0
+				else:
+					no_improve_epochs += 1
+
+				if no_improve_epochs >= early_stopping_patience:
+					logging.info(f"[EARLY STOPPING] No improvement in {early_stopping_patience} epochs. Stopping training.")
+					break
+
 			if macro_f1 > best_macro_f1:
 				best_macro_f1 = macro_f1
 
@@ -272,6 +285,7 @@ class AbstractFMAGenreModule(nn.Module, ABC):
 				'best_macro_f1': best_macro_f1
 			}, path)
 
+	@torch.no_grad
 	def fma_test(
 		self, 
 		test_dataset: VariableFMADataset, 
