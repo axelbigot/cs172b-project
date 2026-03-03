@@ -15,13 +15,15 @@ from src.model_analyzer import TrainingVisualizer
 from src.constants import DATA_DIRECTORY
 from src.fma.vgg_dataset import VGGishFrameDataset, collate_vggish_frames
 
+FREEZE_EPOCHS = 5  # epochs to train classifier only before unfreezing backbone
+
 
 class VGGishFMA(AbstractFMAGenreModule):
     def __init__(self, tag=""):
         super().__init__(tag)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # VGGish backbone + classifier head
+        # VGGish backbone
         self.model = vggish().to(self.device)
 
         # Move PCA buffers to device if they exist
@@ -30,8 +32,14 @@ class VGGishFMA(AbstractFMAGenreModule):
         if hasattr(self.model, '_pca_means'):
             self.model._pca_means = self.model._pca_means.to(self.device)
 
+        # Bigger classifier head
         self.classifier = nn.Sequential(
-            nn.Linear(128, 256),
+            nn.Linear(128, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(256, 16),
@@ -79,7 +87,7 @@ class VGGishFMA(AbstractFMAGenreModule):
     # ----------------------------
     # Training
     # ----------------------------
-    def fma_train(self, train_dataset, val_dataset, epochs=20, batch_size=32, lr=1e-3):
+    def fma_train(self, train_dataset, val_dataset, epochs=100, batch_size=32, lr=3e-4):
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True,
             collate_fn=collate_vggish_frames,
@@ -89,16 +97,33 @@ class VGGishFMA(AbstractFMAGenreModule):
             collate_fn=collate_vggish_frames,
         )
 
-        optimizer = torch.optim.Adam(
-            list(self.model.parameters()) + list(self.classifier.parameters()), lr=lr
-        )
         criterion = nn.CrossEntropyLoss()
-
         idstr = self.get_idstr(train_dataset)
         visualizer = TrainingVisualizer(train_dataset, idstr=idstr)
         checkpoint_path = Path(DATA_DIRECTORY) / f"{idstr}-checkpoint.pt"
 
+        # Start with frozen backbone
+        logging.info("[TRAIN] Freezing VGGish backbone for first %d epochs", FREEZE_EPOCHS)
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        optimizer = torch.optim.Adam(self.classifier.parameters(), lr=lr)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+
         for epoch in range(1, epochs + 1):
+
+            # Unfreeze backbone after FREEZE_EPOCHS
+            if epoch == FREEZE_EPOCHS + 1:
+                logging.info("[TRAIN] Unfreezing VGGish backbone")
+                for param in self.model.parameters():
+                    param.requires_grad = True
+                # Rebuild optimizer to include backbone params
+                optimizer = torch.optim.Adam(
+                    list(self.model.parameters()) + list(self.classifier.parameters()),
+                    lr=lr
+                )
+                scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+
             # -------- Train --------
             self.model.train()
             self.classifier.train()
@@ -117,6 +142,7 @@ class VGGishFMA(AbstractFMAGenreModule):
                 train_loss    += loss.item() * labels.size(0)
                 train_correct += (logits.argmax(1) == labels).sum().item()
 
+            scheduler.step()
             train_loss /= len(train_dataset)
             train_acc   = train_correct / len(train_dataset)
 
@@ -155,7 +181,8 @@ class VGGishFMA(AbstractFMAGenreModule):
 
             print(
                 f"Epoch {epoch} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
-                f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | Macro F1: {macro_f1:.4f}"
+                f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | Macro F1: {macro_f1:.4f} | "
+                f"LR: {scheduler.get_last_lr()[0]:.6f}"
             )
 
             torch.save({
