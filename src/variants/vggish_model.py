@@ -179,7 +179,7 @@ class VGGishFMA(AbstractFMAGenreModule):
         self.classifier.eval()
         correct, total = 0, 0
 
-        for frames, labels, track_sizes, _ in test_loader:
+        for frames, labels, track_sizes, _ in tqdm(test_loader, desc="Testing"):
             frames = frames.to(self.device)
             labels = labels.to(self.device)
             logits = self.forward(frames, track_sizes)
