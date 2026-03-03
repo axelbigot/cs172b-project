@@ -23,6 +23,11 @@ class VGGishFMA(AbstractFMAGenreModule):
 
         # VGGish backbone + classifier head
         self.model = vggish().to(self.device)
+
+        # Move VGGish's internal PCA buffers to the correct device
+        self.model._pca_matrix = self.model._pca_matrix.to(self.device)
+        self.model._pca_means = self.model._pca_means.to(self.device)
+
         self.classifier = nn.Sequential(
             nn.Linear(128, 256),
             nn.ReLU(),
@@ -113,7 +118,7 @@ class VGGishFMA(AbstractFMAGenreModule):
                 loss.backward()
                 optimizer.step()
 
-                train_loss   += loss.item() * labels.size(0)
+                train_loss    += loss.item() * labels.size(0)
                 train_correct += (logits.argmax(1) == labels).sum().item()
 
             train_loss /= len(train_dataset)
