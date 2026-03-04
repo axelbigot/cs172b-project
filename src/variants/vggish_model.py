@@ -64,7 +64,8 @@ def _random_frame_dropout(frames: torch.Tensor, track_sizes: list, p: float = 0.
 # ---------------------------------------------------------------------------
 class VGGishFMA(AbstractFMAGenreModule):
     def __init__(self, tag=""):
-        super().__init__(tag)
+        super().__init__()
+        self.tag = tag
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # VGGish backbone
