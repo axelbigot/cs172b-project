@@ -4,12 +4,14 @@ from src.variants.mfcc_cnn import *
 from src.variants.baseline import *
 from src.variants.mel_cnn_v2 import *
 from src.variants.mfcc_cnn_v2 import *
+from src.variants.mfcc_cnn_transformer import *
 
 __all__ = [
 	'ExampleFMAModel',
 	'MelCNNFMAModel',
     'MFCC_CNNFMAModel',
     'MFCC_CNNFMAModelV3',
+    'MFCC_TransformerCNNModel',
 	'MelMLPFMAModel',
 	'MelCNNFMAModelV2'
 ]
