@@ -1,108 +1,319 @@
 """
-src/fma/mert_dataset.py
+src/variants/mert_model.py
 
-Loads raw waveforms from FMA small at 24kHz for MERT.
-Caches to disk on first run — subsequent runs load instantly.
+MERT-v1-95M backbone for FMA genre classification.
+  - Raw waveform input at 24kHz
+  - fp16 backbone + gradient checkpointing to fit in 15GB VRAM
+  - batch_size=4 default
+  - Attention pooling over time steps -> single track embedding
+  - Classifier head 768 -> 512 -> 256 -> 16
 """
-from src.fma.fma_dataset import VariableFMADataset
-from pathlib import Path
 import torch
-import numpy as np
-import librosa
-import logging
-from typing import Tuple, List
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from transformers import AutoModel
 from tqdm import tqdm
+from pathlib import Path
+from sklearn.metrics import f1_score, confusion_matrix
+import logging
+
+from src.common import AbstractFMAGenreModule
+from src.model_analyzer import TrainingVisualizer
 from src.constants import DATA_DIRECTORY
+from src.fma.mert_dataset import MERTDataset, collate_mert
 
-MERT_SAMPLE_RATE = 24000   # MERT-v1 requires 24kHz
-MAX_DURATION_SEC = 30      # cap audio length
-
-
-def load_audio_mert(audio: np.ndarray, orig_sr: int) -> torch.Tensor:
-    """
-    Resample audio to 24kHz and return as float32 tensor (T,).
-    Clips to MAX_DURATION_SEC to keep memory bounded.
-    """
-    if orig_sr != MERT_SAMPLE_RATE:
-        audio = librosa.resample(audio, orig_sr=orig_sr, target_sr=MERT_SAMPLE_RATE)
-    max_samples = MAX_DURATION_SEC * MERT_SAMPLE_RATE
-    audio = audio[:max_samples]
-    return torch.from_numpy(audio.astype(np.float32))
+MERT_MODEL_NAME   = "m-a-p/MERT-v1-95M"
+FREEZE_EPOCHS     = 5
+BACKBONE_LR_SCALE = 0.05
+HIDDEN_DIM        = 768
+GRAD_ACCUM_STEPS  = 4   # simulate batch_size=16
+EARLY_STOP_PATIENCE = 10  # stop if val acc does not improve for this many epochs
 
 
-class MERTDataset(VariableFMADataset):
-    """
-    Extends VariableFMADataset — precomputes 24kHz waveforms and caches to disk.
+# ---------------------------------------------------------------------------
+# Attention pooling
+# ---------------------------------------------------------------------------
+class AttentionPool(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.W = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, 1, bias=False)
 
-    __getitem__ returns:
-        waveform : (T,)  float32 tensor
-        label    : ()    LongTensor
-        index    : int
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        orig_sr = self.sampling_rate_
-        cache_path = Path(DATA_DIRECTORY) / f"mert_waveform_cache_{self.idstr_}.pt"
-
-        if cache_path.exists():
-            logging.info(f"[MERTDataset] Loading cached waveforms from {cache_path}")
-            self.waveforms_, self.wave_labels_ = torch.load(cache_path)
-        else:
-            logging.info(f"[MERTDataset] Precomputing waveforms for {len(self.index_)} tracks")
-            self._precompute(cache_path, orig_sr)
-
-    def _precompute(self, cache_path: Path, orig_sr: int):
-        waveforms_list: List[torch.Tensor] = []
-        labels_list: List[torch.Tensor] = []
-
-        for idx in tqdm(range(len(self.index_)), desc="Precomputing MERT waveforms"):
-            try:
-                audio_loader, label, _ = super().__getitem__(idx)
-                audio = audio_loader("cpu").numpy()
-                waveform = load_audio_mert(audio, orig_sr)
-                waveforms_list.append(waveform)
-                labels_list.append(label)
-            except Exception as e:
-                logging.warning(f"[MERTDataset] Skipping track {idx}: {e}")
-
-        self.waveforms_ = waveforms_list
-        self.wave_labels_ = torch.stack(labels_list)
-
-        torch.save((self.waveforms_, self.wave_labels_), cache_path)
-        logging.info(f"[MERTDataset] Saved waveform cache to {cache_path}")
-
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        return self.waveforms_[index], self.wave_labels_[index], index
-
-    def __len__(self):
-        return len(self.waveforms_)
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        # x: (T, dim),  mask: (T,) 1=real 0=pad
+        scores = self.v(torch.tanh(self.W(x.float())))     # (T, 1) — float32 for stability
+        if mask is not None:
+            scores = scores.masked_fill(mask.unsqueeze(-1) == 0, -1e9)
+        weights = torch.softmax(scores, dim=0)              # (T, 1)
+        return (weights * x.float()).sum(dim=0)             # (dim,)
 
 
-def collate_mert(batch):
-    """
-    Pad waveforms to same length within batch.
+# ---------------------------------------------------------------------------
+# Augmentation
+# ---------------------------------------------------------------------------
+def _add_gaussian_noise(waveforms: torch.Tensor, std: float = 0.005) -> torch.Tensor:
+    return waveforms + torch.randn_like(waveforms) * std
 
-    Returns:
-        waveforms   : (B, T)        padded float32
-        attention_mask: (B, T)      1 where real, 0 where padded
-        labels      : (B,)          LongTensor
-        ids         : list[int]
-    """
-    waveforms, labels, ids = zip(*batch)
-    max_len = max(w.shape[0] for w in waveforms)
 
-    padded = torch.zeros(len(waveforms), max_len)
-    mask = torch.zeros(len(waveforms), max_len)
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+class MERTFMA(AbstractFMAGenreModule):
+    def __init__(self, tag=""):
+        super().__init__()
+        self.tag = tag
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    for i, w in enumerate(waveforms):
-        padded[i, :w.shape[0]] = w
-        mask[i, :w.shape[0]] = 1.0
+        logging.info(f"[MERT] Loading {MERT_MODEL_NAME} in fp16 with gradient checkpointing")
+        self.backbone = AutoModel.from_pretrained(
+            MERT_MODEL_NAME,
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+        ).to(self.device)
 
-    return (
-        padded,
-        mask,
-        torch.stack(labels).long(),
-        list(ids),
-    )
+        # Gradient checkpointing — recomputes activations on backward pass
+        # trades ~20% speed for ~40% VRAM savings
+        self.backbone.gradient_checkpointing_enable()
+
+        # Classifier in float32 for stability
+        self.attn_pool = AttentionPool(HIDDEN_DIM).to(self.device)
+        self.classifier = nn.Sequential(
+            nn.Linear(HIDDEN_DIM, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 16),
+        ).to(self.device)
+
+    @classmethod
+    def name(cls):
+        return "mert"
+
+    # ----------------------------
+    # Forward
+    # ----------------------------
+    def forward(self, waveforms: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        # Cast waveforms to fp16 for backbone
+        outputs = self.backbone(
+            input_values=waveforms.half(),
+            attention_mask=attention_mask,
+            output_hidden_states=False,
+        )
+        hidden = outputs.last_hidden_state  # (B, T', 768) fp16
+
+        # Downsample attention mask to match hidden state length
+        T_out = hidden.shape[1]
+        attn_down = torch.nn.functional.interpolate(
+            attention_mask.float().unsqueeze(1),
+            size=T_out,
+            mode='nearest'
+        ).squeeze(1)  # (B, T')
+
+        # Attention pool — runs in float32
+        track_embeddings = []
+        for i in range(hidden.shape[0]):
+            track_embeddings.append(self.attn_pool(hidden[i], attn_down[i]))
+        track_embeddings = torch.stack(track_embeddings)  # (B, 768)
+
+        return self.classifier(track_embeddings)           # (B, 16)
+
+    # ----------------------------
+    # AbstractFMAGenreModule overrides
+    # ----------------------------
+    @classmethod
+    def train_generic(cls, train_dataset, val_dataset, **kwargs):
+        model = cls(tag=kwargs.get('tag', ''))
+        return model.fma_train(train_dataset, val_dataset, **kwargs)
+
+    @classmethod
+    def test_generic(cls, test_dataset, **kwargs):
+        model = cls(tag=kwargs.get('tag', ''))
+        return model.fma_test(test_dataset, **kwargs)
+
+    def get_idstr(self, dataset):
+        base_dataset = getattr(dataset, 'dataset', dataset)
+        frac = getattr(base_dataset, 'dowsample_frac', 'NA')
+        return (
+            f'model_trained_{self.name()}'
+            f'{f"_tag-{self.tag}" if len(self.tag) else ""}'
+            f'_{base_dataset.__class__.__name__}_frac-{frac}'
+        )
+
+    def _make_optimizer(self, lr: float, backbone_frozen: bool):
+        head_params = list(self.classifier.parameters()) + list(self.attn_pool.parameters())
+        if backbone_frozen:
+            return torch.optim.AdamW(head_params, lr=lr, weight_decay=1e-4)
+        return torch.optim.AdamW([
+            {'params': self.backbone.parameters(), 'lr': lr * BACKBONE_LR_SCALE},
+            {'params': head_params,                'lr': lr},
+        ], weight_decay=1e-4)
+
+    # ----------------------------
+    # Training
+    # ----------------------------
+    def fma_train(self, train_dataset, val_dataset, epochs=100, batch_size=4, lr=3e-4):
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True,
+            collate_fn=collate_mert, num_workers=2, pin_memory=True, drop_last=True,
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=batch_size, shuffle=False,
+            collate_fn=collate_mert, num_workers=2, pin_memory=True,
+        )
+
+        criterion = nn.CrossEntropyLoss()
+        idstr = self.get_idstr(train_dataset)
+        visualizer = TrainingVisualizer(train_dataset, idstr=idstr)
+        checkpoint_path = Path(DATA_DIRECTORY) / f"{idstr}-checkpoint.pt"
+        best_checkpoint_path = Path(DATA_DIRECTORY) / f"{idstr}-best.pt"
+        best_val_acc = 0.0
+        epochs_no_improve = 0
+
+        # Phase 1: freeze backbone
+        logging.info("[MERT] Freezing backbone for first %d epochs", FREEZE_EPOCHS)
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        optimizer = self._make_optimizer(lr, backbone_frozen=True)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=FREEZE_EPOCHS, eta_min=lr * 0.1
+        )
+
+        for epoch in range(1, epochs + 1):
+
+            # Phase 2: unfreeze backbone
+            if epoch == FREEZE_EPOCHS + 1:
+                logging.info("[MERT] Unfreezing backbone (backbone LR = %.2e)", lr * BACKBONE_LR_SCALE)
+                for param in self.backbone.parameters():
+                    param.requires_grad = True
+                optimizer = self._make_optimizer(lr, backbone_frozen=False)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=epochs - FREEZE_EPOCHS, eta_min=lr * 0.01
+                )
+
+            # -------- Train --------
+            self.backbone.train()
+            self.classifier.train()
+            self.attn_pool.train()
+            train_loss, train_correct = 0.0, 0
+
+            optimizer.zero_grad()
+            for step, (waveforms, masks, labels, _) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch} Training")):
+                waveforms = waveforms.to(self.device)
+                masks     = masks.to(self.device)
+                labels    = labels.to(self.device)
+
+                waveforms = _add_gaussian_noise(waveforms)
+
+                logits = self.forward(waveforms, masks)
+                loss = criterion(logits, labels) / GRAD_ACCUM_STEPS
+                loss.backward()
+
+                if (step + 1) % GRAD_ACCUM_STEPS == 0:
+                    torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                train_loss    += loss.item() * GRAD_ACCUM_STEPS * labels.size(0)
+                train_correct += (logits.argmax(1) == labels).sum().item()
+
+            scheduler.step()
+            train_loss /= len(train_dataset)
+            train_acc   = train_correct / len(train_dataset)
+
+            # -------- Validation --------
+            self.backbone.eval()
+            self.classifier.eval()
+            self.attn_pool.eval()
+            val_loss, val_correct = 0.0, 0
+            all_preds, all_labels = [], []
+
+            with torch.no_grad():
+                for waveforms, masks, labels, _ in tqdm(val_loader, desc=f"Epoch {epoch} Validation"):
+                    waveforms = waveforms.to(self.device)
+                    masks     = masks.to(self.device)
+                    labels    = labels.to(self.device)
+
+                    logits = self.forward(waveforms, masks)
+                    loss   = criterion(logits, labels)
+
+                    val_loss    += loss.item() * labels.size(0)
+                    val_correct += (logits.argmax(1) == labels).sum().item()
+                    all_preds.append(logits.argmax(1).cpu())
+                    all_labels.append(labels.cpu())
+
+            val_loss /= len(val_dataset)
+            val_acc   = val_correct / len(val_dataset)
+
+            all_preds  = torch.cat(all_preds)
+            all_labels = torch.cat(all_labels)
+            macro_f1   = f1_score(all_labels, all_preds, average='macro')
+            cm         = confusion_matrix(all_labels, all_preds)
+            per_class_acc = cm.diagonal() / cm.sum(axis=1)
+
+            visualizer.update(
+                epoch, train_loss, train_acc, val_loss, val_acc,
+                macro_f1, per_class_acc, cm=cm, snapshot=True,
+            )
+
+            current_lr = optimizer.param_groups[-1]['lr']
+            print(
+                f"Epoch {epoch} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
+                f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | Macro F1: {macro_f1:.4f} | "
+                f"LR: {current_lr:.6f}"
+            )
+
+            state = {
+                'backbone_state_dict':   self.backbone.state_dict(),
+                'classifier_state_dict': self.classifier.state_dict(),
+                'attn_pool_state_dict':  self.attn_pool.state_dict(),
+                'optimizer_state_dict':  optimizer.state_dict(),
+                'epoch':                 epoch,
+            }
+            torch.save(state, checkpoint_path)
+
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                epochs_no_improve = 0
+                torch.save(state, best_checkpoint_path)
+                logging.info("[MERT] New best val acc: %.4f", best_val_acc)
+            else:
+                epochs_no_improve += 1
+                logging.info("[MERT] No improvement for %d/%d epochs", epochs_no_improve, EARLY_STOP_PATIENCE)
+                if epochs_no_improve >= EARLY_STOP_PATIENCE:
+                    logging.info("[MERT] Early stopping triggered at epoch %d", epoch)
+                    print(f"Early stopping at epoch {epoch} — no improvement for {EARLY_STOP_PATIENCE} epochs")
+                    break
+
+        logging.info("[MERT] Best val acc: %.4f", best_val_acc)
+        return visualizer
+
+    # ----------------------------
+    # Testing
+    # ----------------------------
+    @torch.no_grad()
+    def fma_test(self, test_dataset, batch_size=4):
+        test_loader = DataLoader(
+            test_dataset, batch_size=batch_size, shuffle=False,
+            collate_fn=collate_mert,
+        )
+        self.backbone.eval()
+        self.classifier.eval()
+        self.attn_pool.eval()
+        correct, total = 0, 0
+
+        for waveforms, masks, labels, _ in tqdm(test_loader, desc="Testing"):
+            waveforms = waveforms.to(self.device)
+            masks     = masks.to(self.device)
+            labels    = labels.to(self.device)
+            logits = self.forward(waveforms, masks)
+            correct += (logits.argmax(1) == labels).sum().item()
+            total   += labels.size(0)
+
+        accuracy = correct / total
+        logging.info(f"[MERT TEST] Accuracy: {accuracy:.4f}")
+        return accuracy
