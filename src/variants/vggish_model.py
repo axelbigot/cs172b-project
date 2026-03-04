@@ -1,17 +1,17 @@
 """
-src/variants/vggish_model.py
+src/variants/mert_model.py
 
-Improvements over baseline:
-  1. Attention pooling   – replaces mean-pool; learns which windows matter per track
-  2. Differential LRs   – backbone gets 10x smaller LR than classifier head
-  3. CosineAnnealingLR  – replaces aggressive StepLR
-  4. Augmentation       – Gaussian noise + random frame dropout during training
+MERT-v1-95M backbone for FMA genre classification.
+  - Raw waveform input at 24kHz
+  - fp16 backbone + gradient checkpointing to fit in 15GB VRAM
+  - batch_size=4 default
+  - Attention pooling over time steps -> single track embedding
+  - Classifier head 768 -> 512 -> 256 -> 16
 """
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torchvggish import vggish
+from transformers import AutoModel
 from tqdm import tqdm
 from pathlib import Path
 from sklearn.metrics import f1_score, confusion_matrix
@@ -20,68 +20,63 @@ import logging
 from src.common import AbstractFMAGenreModule
 from src.model_analyzer import TrainingVisualizer
 from src.constants import DATA_DIRECTORY
-from src.fma.vgg_dataset import VGGishFrameDataset, collate_vggish_frames
+from src.fma.mert_dataset import MERTDataset, collate_mert
 
-FREEZE_EPOCHS = 5          # epochs to train classifier only before unfreezing backbone
-BACKBONE_LR_SCALE = 0.1    # backbone LR = base_lr * this
+MERT_MODEL_NAME   = "m-a-p/MERT-v1-95M"
+FREEZE_EPOCHS     = 5
+BACKBONE_LR_SCALE = 0.05
+HIDDEN_DIM        = 768
 
 
 # ---------------------------------------------------------------------------
-# Attention pooling module
+# Attention pooling
 # ---------------------------------------------------------------------------
 class AttentionPool(nn.Module):
-    """
-    Soft-attention over T window embeddings → single track embedding.
-    score_t = v^T tanh(W h_t)   then   out = sum_t softmax(score_t) * h_t
-    """
     def __init__(self, dim: int):
         super().__init__()
         self.W = nn.Linear(dim, dim)
         self.v = nn.Linear(dim, 1, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (T, dim)
-        scores = self.v(torch.tanh(self.W(x)))   # (T, 1)
-        weights = torch.softmax(scores, dim=0)    # (T, 1)
-        return (weights * x).sum(dim=0)           # (dim,)
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        # x: (T, dim),  mask: (T,) 1=real 0=pad
+        scores = self.v(torch.tanh(self.W(x.float())))     # (T, 1) — float32 for stability
+        if mask is not None:
+            scores = scores.masked_fill(mask.unsqueeze(-1) == 0, -1e9)
+        weights = torch.softmax(scores, dim=0)              # (T, 1)
+        return (weights * x.float()).sum(dim=0)             # (dim,)
 
 
 # ---------------------------------------------------------------------------
-# Augmentation helpers
+# Augmentation
 # ---------------------------------------------------------------------------
-def _add_gaussian_noise(frames: torch.Tensor, std: float = 0.02) -> torch.Tensor:
-    return frames + torch.randn_like(frames) * std
-
-
-def _random_frame_dropout(frames: torch.Tensor, track_sizes: list, p: float = 0.1):
-    """Randomly zero-out entire windows with probability p (training only)."""
-    mask = (torch.rand(frames.size(0), device=frames.device) > p).float()
-    return frames * mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1), track_sizes
+def _add_gaussian_noise(waveforms: torch.Tensor, std: float = 0.005) -> torch.Tensor:
+    return waveforms + torch.randn_like(waveforms) * std
 
 
 # ---------------------------------------------------------------------------
-# Main model
+# Model
 # ---------------------------------------------------------------------------
-class VGGishFMA(AbstractFMAGenreModule):
+class MERTFMA(AbstractFMAGenreModule):
     def __init__(self, tag=""):
         super().__init__()
         self.tag = tag
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # VGGish backbone
-        self.model = vggish().to(self.device)
+        logging.info(f"[MERT] Loading {MERT_MODEL_NAME} in fp16 with gradient checkpointing")
+        self.backbone = AutoModel.from_pretrained(
+            MERT_MODEL_NAME,
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+        ).to(self.device)
 
-        # Move PCA buffers to device if they exist
-        for attr in ('_pca_matrix', '_pca_means'):
-            if hasattr(self.model, attr):
-                setattr(self.model, attr, getattr(self.model, attr).to(self.device))
+        # Gradient checkpointing — recomputes activations on backward pass
+        # trades ~20% speed for ~40% VRAM savings
+        self.backbone.gradient_checkpointing_enable()
 
-        # Attention pooling (replaces mean-pool)
-        self.attn_pool = AttentionPool(128).to(self.device)
-
-        # Classifier head
+        # Classifier in float32 for stability
+        self.attn_pool = AttentionPool(HIDDEN_DIM).to(self.device)
         self.classifier = nn.Sequential(
-            nn.Linear(128, 512),
+            nn.Linear(HIDDEN_DIM, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(),
             nn.Dropout(0.3),
@@ -94,22 +89,33 @@ class VGGishFMA(AbstractFMAGenreModule):
 
     @classmethod
     def name(cls):
-        return "vggish"
+        return "mert"
 
     # ----------------------------
     # Forward
     # ----------------------------
-    def forward(self, frames: torch.Tensor, track_sizes: list) -> torch.Tensor:
-        embeddings = self.model(frames)           # (total_windows, 128)
+    def forward(self, waveforms: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        # Cast waveforms to fp16 for backbone
+        outputs = self.backbone(
+            input_values=waveforms.half(),
+            attention_mask=attention_mask,
+            output_hidden_states=False,
+        )
+        hidden = outputs.last_hidden_state  # (B, T', 768) fp16
 
-        # Attention-pool window embeddings back to one per track
+        # Downsample attention mask to match hidden state length
+        T_out = hidden.shape[1]
+        attn_down = torch.nn.functional.interpolate(
+            attention_mask.float().unsqueeze(1),
+            size=T_out,
+            mode='nearest'
+        ).squeeze(1)  # (B, T')
+
+        # Attention pool — runs in float32
         track_embeddings = []
-        idx = 0
-        for n in track_sizes:
-            chunk = embeddings[idx:idx + n]       # (n, 128)
-            track_embeddings.append(self.attn_pool(chunk))
-            idx += n
-        track_embeddings = torch.stack(track_embeddings)  # (B, 128)
+        for i in range(hidden.shape[0]):
+            track_embeddings.append(self.attn_pool(hidden[i], attn_down[i]))
+        track_embeddings = torch.stack(track_embeddings)  # (B, 768)
 
         return self.classifier(track_embeddings)           # (B, 16)
 
@@ -136,45 +142,39 @@ class VGGishFMA(AbstractFMAGenreModule):
         )
 
     def _make_optimizer(self, lr: float, backbone_frozen: bool):
-        """
-        Build optimizer with differential LRs.
-        When backbone is frozen, only train classifier + attention pool.
-        When unfrozen, backbone gets BACKBONE_LR_SCALE * lr.
-        """
         head_params = list(self.classifier.parameters()) + list(self.attn_pool.parameters())
         if backbone_frozen:
-            return torch.optim.Adam(head_params, lr=lr)
-        return torch.optim.Adam([
-            {'params': self.model.parameters(),  'lr': lr * BACKBONE_LR_SCALE},
-            {'params': head_params,               'lr': lr},
-        ])
+            return torch.optim.AdamW(head_params, lr=lr, weight_decay=1e-4)
+        return torch.optim.AdamW([
+            {'params': self.backbone.parameters(), 'lr': lr * BACKBONE_LR_SCALE},
+            {'params': head_params,                'lr': lr},
+        ], weight_decay=1e-4)
 
     # ----------------------------
     # Training
     # ----------------------------
-    def fma_train(self, train_dataset, val_dataset, epochs=100, batch_size=32, lr=3e-4):
+    def fma_train(self, train_dataset, val_dataset, epochs=100, batch_size=4, lr=3e-4):
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True,
-            collate_fn=collate_vggish_frames,
+            collate_fn=collate_mert, num_workers=2, pin_memory=True,
         )
         val_loader = DataLoader(
             val_dataset, batch_size=batch_size, shuffle=False,
-            collate_fn=collate_vggish_frames,
+            collate_fn=collate_mert, num_workers=2, pin_memory=True,
         )
 
         criterion = nn.CrossEntropyLoss()
         idstr = self.get_idstr(train_dataset)
         visualizer = TrainingVisualizer(train_dataset, idstr=idstr)
         checkpoint_path = Path(DATA_DIRECTORY) / f"{idstr}-checkpoint.pt"
-        best_val_acc = 0.0
         best_checkpoint_path = Path(DATA_DIRECTORY) / f"{idstr}-best.pt"
+        best_val_acc = 0.0
 
-        # ---- Phase 1: freeze backbone ----
-        logging.info("[TRAIN] Freezing VGGish backbone for first %d epochs", FREEZE_EPOCHS)
-        for param in self.model.parameters():
+        # Phase 1: freeze backbone
+        logging.info("[MERT] Freezing backbone for first %d epochs", FREEZE_EPOCHS)
+        for param in self.backbone.parameters():
             param.requires_grad = False
 
-        backbone_frozen = True
         optimizer = self._make_optimizer(lr, backbone_frozen=True)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=FREEZE_EPOCHS, eta_min=lr * 0.1
@@ -182,35 +182,34 @@ class VGGishFMA(AbstractFMAGenreModule):
 
         for epoch in range(1, epochs + 1):
 
-            # ---- Phase 2: unfreeze backbone ----
+            # Phase 2: unfreeze backbone
             if epoch == FREEZE_EPOCHS + 1:
-                logging.info("[TRAIN] Unfreezing VGGish backbone (backbone LR = %.2e)", lr * BACKBONE_LR_SCALE)
-                for param in self.model.parameters():
+                logging.info("[MERT] Unfreezing backbone (backbone LR = %.2e)", lr * BACKBONE_LR_SCALE)
+                for param in self.backbone.parameters():
                     param.requires_grad = True
-                backbone_frozen = False
                 optimizer = self._make_optimizer(lr, backbone_frozen=False)
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                     optimizer, T_max=epochs - FREEZE_EPOCHS, eta_min=lr * 0.01
                 )
 
             # -------- Train --------
-            self.model.train()
+            self.backbone.train()
             self.classifier.train()
             self.attn_pool.train()
             train_loss, train_correct = 0.0, 0
 
-            for frames, labels, track_sizes, _ in tqdm(train_loader, desc=f"Epoch {epoch} Training"):
-                frames = frames.to(self.device)
-                labels = labels.to(self.device)
+            for waveforms, masks, labels, _ in tqdm(train_loader, desc=f"Epoch {epoch} Training"):
+                waveforms = waveforms.to(self.device)
+                masks     = masks.to(self.device)
+                labels    = labels.to(self.device)
 
-                # Augmentation (training only)
-                frames = _add_gaussian_noise(frames)
-                frames, track_sizes = _random_frame_dropout(frames, track_sizes)
+                waveforms = _add_gaussian_noise(waveforms)
 
                 optimizer.zero_grad()
-                logits = self.forward(frames, track_sizes)
+                logits = self.forward(waveforms, masks)
                 loss = criterion(logits, labels)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
                 optimizer.step()
 
                 train_loss    += loss.item() * labels.size(0)
@@ -221,18 +220,19 @@ class VGGishFMA(AbstractFMAGenreModule):
             train_acc   = train_correct / len(train_dataset)
 
             # -------- Validation --------
-            self.model.eval()
+            self.backbone.eval()
             self.classifier.eval()
             self.attn_pool.eval()
             val_loss, val_correct = 0.0, 0
             all_preds, all_labels = [], []
 
             with torch.no_grad():
-                for frames, labels, track_sizes, _ in tqdm(val_loader, desc=f"Epoch {epoch} Validation"):
-                    frames = frames.to(self.device)
-                    labels = labels.to(self.device)
+                for waveforms, masks, labels, _ in tqdm(val_loader, desc=f"Epoch {epoch} Validation"):
+                    waveforms = waveforms.to(self.device)
+                    masks     = masks.to(self.device)
+                    labels    = labels.to(self.device)
 
-                    logits = self.forward(frames, track_sizes)
+                    logits = self.forward(waveforms, masks)
                     loss   = criterion(logits, labels)
 
                     val_loss    += loss.item() * labels.size(0)
@@ -254,7 +254,6 @@ class VGGishFMA(AbstractFMAGenreModule):
                 macro_f1, per_class_acc, cm=cm, snapshot=True,
             )
 
-            # Get current LR for logging (head LR)
             current_lr = optimizer.param_groups[-1]['lr']
             print(
                 f"Epoch {epoch} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
@@ -262,9 +261,8 @@ class VGGishFMA(AbstractFMAGenreModule):
                 f"LR: {current_lr:.6f}"
             )
 
-            # Save latest checkpoint
             state = {
-                'model_state_dict':      self.model.state_dict(),
+                'backbone_state_dict':   self.backbone.state_dict(),
                 'classifier_state_dict': self.classifier.state_dict(),
                 'attn_pool_state_dict':  self.attn_pool.state_dict(),
                 'optimizer_state_dict':  optimizer.state_dict(),
@@ -272,36 +270,36 @@ class VGGishFMA(AbstractFMAGenreModule):
             }
             torch.save(state, checkpoint_path)
 
-            # Save best checkpoint separately
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 torch.save(state, best_checkpoint_path)
-                logging.info("[TRAIN] New best val acc: %.4f — saved to %s", best_val_acc, best_checkpoint_path)
+                logging.info("[MERT] New best val acc: %.4f", best_val_acc)
 
-        logging.info("[TRAIN] Best val acc across all epochs: %.4f", best_val_acc)
+        logging.info("[MERT] Best val acc: %.4f", best_val_acc)
         return visualizer
 
     # ----------------------------
     # Testing
     # ----------------------------
     @torch.no_grad()
-    def fma_test(self, test_dataset, batch_size=32):
+    def fma_test(self, test_dataset, batch_size=4):
         test_loader = DataLoader(
             test_dataset, batch_size=batch_size, shuffle=False,
-            collate_fn=collate_vggish_frames,
+            collate_fn=collate_mert,
         )
-        self.model.eval()
+        self.backbone.eval()
         self.classifier.eval()
         self.attn_pool.eval()
         correct, total = 0, 0
 
-        for frames, labels, track_sizes, _ in tqdm(test_loader, desc="Testing"):
-            frames = frames.to(self.device)
-            labels = labels.to(self.device)
-            logits = self.forward(frames, track_sizes)
+        for waveforms, masks, labels, _ in tqdm(test_loader, desc="Testing"):
+            waveforms = waveforms.to(self.device)
+            masks     = masks.to(self.device)
+            labels    = labels.to(self.device)
+            logits = self.forward(waveforms, masks)
             correct += (logits.argmax(1) == labels).sum().item()
             total   += labels.size(0)
 
         accuracy = correct / total
-        logging.info(f"[TEST] Accuracy: {accuracy:.4f}")
+        logging.info(f"[MERT TEST] Accuracy: {accuracy:.4f}")
         return accuracy
