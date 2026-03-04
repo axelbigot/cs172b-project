@@ -26,6 +26,8 @@ MERT_MODEL_NAME   = "m-a-p/MERT-v1-95M"
 FREEZE_EPOCHS     = 5
 BACKBONE_LR_SCALE = 0.05
 HIDDEN_DIM        = 768
+GRAD_ACCUM_STEPS  = 4   # simulate batch_size=16
+EARLY_STOP_PATIENCE = 10  # stop if val acc does not improve for this many epochs
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +158,7 @@ class MERTFMA(AbstractFMAGenreModule):
     def fma_train(self, train_dataset, val_dataset, epochs=100, batch_size=4, lr=3e-4):
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True,
-            collate_fn=collate_mert, num_workers=2, pin_memory=True,
+            collate_fn=collate_mert, num_workers=2, pin_memory=True, drop_last=True,
         )
         val_loader = DataLoader(
             val_dataset, batch_size=batch_size, shuffle=False,
@@ -169,6 +171,7 @@ class MERTFMA(AbstractFMAGenreModule):
         checkpoint_path = Path(DATA_DIRECTORY) / f"{idstr}-checkpoint.pt"
         best_checkpoint_path = Path(DATA_DIRECTORY) / f"{idstr}-best.pt"
         best_val_acc = 0.0
+        epochs_no_improve = 0
 
         # Phase 1: freeze backbone
         logging.info("[MERT] Freezing backbone for first %d epochs", FREEZE_EPOCHS)
@@ -198,21 +201,24 @@ class MERTFMA(AbstractFMAGenreModule):
             self.attn_pool.train()
             train_loss, train_correct = 0.0, 0
 
-            for waveforms, masks, labels, _ in tqdm(train_loader, desc=f"Epoch {epoch} Training"):
+            optimizer.zero_grad()
+            for step, (waveforms, masks, labels, _) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch} Training")):
                 waveforms = waveforms.to(self.device)
                 masks     = masks.to(self.device)
                 labels    = labels.to(self.device)
 
                 waveforms = _add_gaussian_noise(waveforms)
 
-                optimizer.zero_grad()
                 logits = self.forward(waveforms, masks)
-                loss = criterion(logits, labels)
+                loss = criterion(logits, labels) / GRAD_ACCUM_STEPS
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
-                optimizer.step()
 
-                train_loss    += loss.item() * labels.size(0)
+                if (step + 1) % GRAD_ACCUM_STEPS == 0:
+                    torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                train_loss    += loss.item() * GRAD_ACCUM_STEPS * labels.size(0)
                 train_correct += (logits.argmax(1) == labels).sum().item()
 
             scheduler.step()
@@ -272,8 +278,16 @@ class MERTFMA(AbstractFMAGenreModule):
 
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
+                epochs_no_improve = 0
                 torch.save(state, best_checkpoint_path)
                 logging.info("[MERT] New best val acc: %.4f", best_val_acc)
+            else:
+                epochs_no_improve += 1
+                logging.info("[MERT] No improvement for %d/%d epochs", epochs_no_improve, EARLY_STOP_PATIENCE)
+                if epochs_no_improve >= EARLY_STOP_PATIENCE:
+                    logging.info("[MERT] Early stopping triggered at epoch %d", epoch)
+                    print(f"Early stopping at epoch {epoch} — no improvement for {EARLY_STOP_PATIENCE} epochs")
+                    break
 
         logging.info("[MERT] Best val acc: %.4f", best_val_acc)
         return visualizer
