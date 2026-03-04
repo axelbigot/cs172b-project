@@ -1,8 +1,15 @@
 """
 src/variants/vggish_model.py
+
+Improvements over baseline:
+  1. Attention pooling   – replaces mean-pool; learns which windows matter per track
+  2. Differential LRs   – backbone gets 10x smaller LR than classifier head
+  3. CosineAnnealingLR  – replaces aggressive StepLR
+  4. Augmentation       – Gaussian noise + random frame dropout during training
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvggish import vggish
 from tqdm import tqdm
@@ -15,9 +22,46 @@ from src.model_analyzer import TrainingVisualizer
 from src.constants import DATA_DIRECTORY
 from src.fma.vgg_dataset import VGGishFrameDataset, collate_vggish_frames
 
-FREEZE_EPOCHS = 5  # epochs to train classifier only before unfreezing backbone
+FREEZE_EPOCHS = 5          # epochs to train classifier only before unfreezing backbone
+BACKBONE_LR_SCALE = 0.1    # backbone LR = base_lr * this
 
 
+# ---------------------------------------------------------------------------
+# Attention pooling module
+# ---------------------------------------------------------------------------
+class AttentionPool(nn.Module):
+    """
+    Soft-attention over T window embeddings → single track embedding.
+    score_t = v^T tanh(W h_t)   then   out = sum_t softmax(score_t) * h_t
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.W = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, 1, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (T, dim)
+        scores = self.v(torch.tanh(self.W(x)))   # (T, 1)
+        weights = torch.softmax(scores, dim=0)    # (T, 1)
+        return (weights * x).sum(dim=0)           # (dim,)
+
+
+# ---------------------------------------------------------------------------
+# Augmentation helpers
+# ---------------------------------------------------------------------------
+def _add_gaussian_noise(frames: torch.Tensor, std: float = 0.02) -> torch.Tensor:
+    return frames + torch.randn_like(frames) * std
+
+
+def _random_frame_dropout(frames: torch.Tensor, track_sizes: list, p: float = 0.1):
+    """Randomly zero-out entire windows with probability p (training only)."""
+    mask = (torch.rand(frames.size(0), device=frames.device) > p).float()
+    return frames * mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1), track_sizes
+
+
+# ---------------------------------------------------------------------------
+# Main model
+# ---------------------------------------------------------------------------
 class VGGishFMA(AbstractFMAGenreModule):
     def __init__(self, tag=""):
         super().__init__(tag)
@@ -27,12 +71,14 @@ class VGGishFMA(AbstractFMAGenreModule):
         self.model = vggish().to(self.device)
 
         # Move PCA buffers to device if they exist
-        if hasattr(self.model, '_pca_matrix'):
-            self.model._pca_matrix = self.model._pca_matrix.to(self.device)
-        if hasattr(self.model, '_pca_means'):
-            self.model._pca_means = self.model._pca_means.to(self.device)
+        for attr in ('_pca_matrix', '_pca_means'):
+            if hasattr(self.model, attr):
+                setattr(self.model, attr, getattr(self.model, attr).to(self.device))
 
-        # Bigger classifier head
+        # Attention pooling (replaces mean-pool)
+        self.attn_pool = AttentionPool(128).to(self.device)
+
+        # Classifier head
         self.classifier = nn.Sequential(
             nn.Linear(128, 512),
             nn.BatchNorm1d(512),
@@ -49,14 +95,18 @@ class VGGishFMA(AbstractFMAGenreModule):
     def name(cls):
         return "vggish"
 
+    # ----------------------------
+    # Forward
+    # ----------------------------
     def forward(self, frames: torch.Tensor, track_sizes: list) -> torch.Tensor:
-        embeddings = self.model(frames)         # (total_windows, 128)
+        embeddings = self.model(frames)           # (total_windows, 128)
 
-        # Mean-pool window embeddings back to one per track
+        # Attention-pool window embeddings back to one per track
         track_embeddings = []
         idx = 0
         for n in track_sizes:
-            track_embeddings.append(embeddings[idx:idx + n].mean(dim=0))
+            chunk = embeddings[idx:idx + n]       # (n, 128)
+            track_embeddings.append(self.attn_pool(chunk))
             idx += n
         track_embeddings = torch.stack(track_embeddings)  # (B, 128)
 
@@ -84,6 +134,20 @@ class VGGishFMA(AbstractFMAGenreModule):
             f'_{base_dataset.__class__.__name__}_frac-{frac}'
         )
 
+    def _make_optimizer(self, lr: float, backbone_frozen: bool):
+        """
+        Build optimizer with differential LRs.
+        When backbone is frozen, only train classifier + attention pool.
+        When unfrozen, backbone gets BACKBONE_LR_SCALE * lr.
+        """
+        head_params = list(self.classifier.parameters()) + list(self.attn_pool.parameters())
+        if backbone_frozen:
+            return torch.optim.Adam(head_params, lr=lr)
+        return torch.optim.Adam([
+            {'params': self.model.parameters(),  'lr': lr * BACKBONE_LR_SCALE},
+            {'params': head_params,               'lr': lr},
+        ])
+
     # ----------------------------
     # Training
     # ----------------------------
@@ -101,37 +165,46 @@ class VGGishFMA(AbstractFMAGenreModule):
         idstr = self.get_idstr(train_dataset)
         visualizer = TrainingVisualizer(train_dataset, idstr=idstr)
         checkpoint_path = Path(DATA_DIRECTORY) / f"{idstr}-checkpoint.pt"
+        best_val_acc = 0.0
+        best_checkpoint_path = Path(DATA_DIRECTORY) / f"{idstr}-best.pt"
 
-        # Start with frozen backbone
+        # ---- Phase 1: freeze backbone ----
         logging.info("[TRAIN] Freezing VGGish backbone for first %d epochs", FREEZE_EPOCHS)
         for param in self.model.parameters():
             param.requires_grad = False
 
-        optimizer = torch.optim.Adam(self.classifier.parameters(), lr=lr)
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+        backbone_frozen = True
+        optimizer = self._make_optimizer(lr, backbone_frozen=True)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=FREEZE_EPOCHS, eta_min=lr * 0.1
+        )
 
         for epoch in range(1, epochs + 1):
 
-            # Unfreeze backbone after FREEZE_EPOCHS
+            # ---- Phase 2: unfreeze backbone ----
             if epoch == FREEZE_EPOCHS + 1:
-                logging.info("[TRAIN] Unfreezing VGGish backbone")
+                logging.info("[TRAIN] Unfreezing VGGish backbone (backbone LR = %.2e)", lr * BACKBONE_LR_SCALE)
                 for param in self.model.parameters():
                     param.requires_grad = True
-                # Rebuild optimizer to include backbone params
-                optimizer = torch.optim.Adam(
-                    list(self.model.parameters()) + list(self.classifier.parameters()),
-                    lr=lr
+                backbone_frozen = False
+                optimizer = self._make_optimizer(lr, backbone_frozen=False)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=epochs - FREEZE_EPOCHS, eta_min=lr * 0.01
                 )
-                scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
 
             # -------- Train --------
             self.model.train()
             self.classifier.train()
+            self.attn_pool.train()
             train_loss, train_correct = 0.0, 0
 
             for frames, labels, track_sizes, _ in tqdm(train_loader, desc=f"Epoch {epoch} Training"):
                 frames = frames.to(self.device)
                 labels = labels.to(self.device)
+
+                # Augmentation (training only)
+                frames = _add_gaussian_noise(frames)
+                frames, track_sizes = _random_frame_dropout(frames, track_sizes)
 
                 optimizer.zero_grad()
                 logits = self.forward(frames, track_sizes)
@@ -149,6 +222,7 @@ class VGGishFMA(AbstractFMAGenreModule):
             # -------- Validation --------
             self.model.eval()
             self.classifier.eval()
+            self.attn_pool.eval()
             val_loss, val_correct = 0.0, 0
             all_preds, all_labels = [], []
 
@@ -179,19 +253,31 @@ class VGGishFMA(AbstractFMAGenreModule):
                 macro_f1, per_class_acc, cm=cm, snapshot=True,
             )
 
+            # Get current LR for logging (head LR)
+            current_lr = optimizer.param_groups[-1]['lr']
             print(
                 f"Epoch {epoch} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
                 f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | Macro F1: {macro_f1:.4f} | "
-                f"LR: {scheduler.get_last_lr()[0]:.6f}"
+                f"LR: {current_lr:.6f}"
             )
 
-            torch.save({
+            # Save latest checkpoint
+            state = {
                 'model_state_dict':      self.model.state_dict(),
                 'classifier_state_dict': self.classifier.state_dict(),
+                'attn_pool_state_dict':  self.attn_pool.state_dict(),
                 'optimizer_state_dict':  optimizer.state_dict(),
                 'epoch':                 epoch,
-            }, checkpoint_path)
+            }
+            torch.save(state, checkpoint_path)
 
+            # Save best checkpoint separately
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                torch.save(state, best_checkpoint_path)
+                logging.info("[TRAIN] New best val acc: %.4f — saved to %s", best_val_acc, best_checkpoint_path)
+
+        logging.info("[TRAIN] Best val acc across all epochs: %.4f", best_val_acc)
         return visualizer
 
     # ----------------------------
@@ -205,6 +291,7 @@ class VGGishFMA(AbstractFMAGenreModule):
         )
         self.model.eval()
         self.classifier.eval()
+        self.attn_pool.eval()
         correct, total = 0, 0
 
         for frames, labels, track_sizes, _ in tqdm(test_loader, desc="Testing"):
