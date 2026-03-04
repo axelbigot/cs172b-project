@@ -3,29 +3,29 @@ src/variants/mert_model.py
 
 MERT-v1-95M backbone for FMA genre classification.
   - Raw waveform input at 24kHz
-  - MERT transformer outputs 768-dim hidden states per time step
+  - fp16 backbone + gradient checkpointing to fit in 15GB VRAM
+  - batch_size=4 default
   - Attention pooling over time steps -> single track embedding
   - Classifier head 768 -> 512 -> 256 -> 16
 """
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from transformers import AutoModel, AutoProcessor
+from transformers import AutoModel
 from tqdm import tqdm
 from pathlib import Path
 from sklearn.metrics import f1_score, confusion_matrix
 import logging
-import numpy as np
 
 from src.common import AbstractFMAGenreModule
 from src.model_analyzer import TrainingVisualizer
 from src.constants import DATA_DIRECTORY
 from src.fma.mert_dataset import MERTDataset, collate_mert
 
-MERT_MODEL_NAME  = "m-a-p/MERT-v1-95M"
-FREEZE_EPOCHS    = 5
-BACKBONE_LR_SCALE = 0.05   # backbone gets 5% of head LR (MERT is large)
-HIDDEN_DIM       = 768
+MERT_MODEL_NAME   = "m-a-p/MERT-v1-95M"
+FREEZE_EPOCHS     = 5
+BACKBONE_LR_SCALE = 0.05
+HIDDEN_DIM        = 768
 
 
 # ---------------------------------------------------------------------------
@@ -39,11 +39,11 @@ class AttentionPool(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         # x: (T, dim),  mask: (T,) 1=real 0=pad
-        scores = self.v(torch.tanh(self.W(x)))          # (T, 1)
+        scores = self.v(torch.tanh(self.W(x.float())))     # (T, 1) — float32 for stability
         if mask is not None:
             scores = scores.masked_fill(mask.unsqueeze(-1) == 0, -1e9)
-        weights = torch.softmax(scores, dim=0)           # (T, 1)
-        return (weights * x).sum(dim=0)                  # (dim,)
+        weights = torch.softmax(scores, dim=0)              # (T, 1)
+        return (weights * x.float()).sum(dim=0)             # (dim,)
 
 
 # ---------------------------------------------------------------------------
@@ -62,13 +62,19 @@ class MERTFMA(AbstractFMAGenreModule):
         self.tag = tag
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        logging.info(f"[MERT] Loading {MERT_MODEL_NAME}")
+        logging.info(f"[MERT] Loading {MERT_MODEL_NAME} in fp16 with gradient checkpointing")
         self.backbone = AutoModel.from_pretrained(
-            MERT_MODEL_NAME, trust_remote_code=True
+            MERT_MODEL_NAME,
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
         ).to(self.device)
 
-        self.attn_pool = AttentionPool(HIDDEN_DIM).to(self.device)
+        # Gradient checkpointing — recomputes activations on backward pass
+        # trades ~20% speed for ~40% VRAM savings
+        self.backbone.gradient_checkpointing_enable()
 
+        # Classifier in float32 for stability
+        self.attn_pool = AttentionPool(HIDDEN_DIM).to(self.device)
         self.classifier = nn.Sequential(
             nn.Linear(HIDDEN_DIM, 512),
             nn.BatchNorm1d(512),
@@ -89,31 +95,26 @@ class MERTFMA(AbstractFMAGenreModule):
     # Forward
     # ----------------------------
     def forward(self, waveforms: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        # waveforms: (B, T), attention_mask: (B, T)
+        # Cast waveforms to fp16 for backbone
         outputs = self.backbone(
-            input_values=waveforms,
+            input_values=waveforms.half(),
             attention_mask=attention_mask,
             output_hidden_states=False,
         )
-        # last_hidden_state: (B, T', 768)
-        hidden = outputs.last_hidden_state
+        hidden = outputs.last_hidden_state  # (B, T', 768) fp16
 
-        # Build time-step mask from attention_mask by downsampling
-        # MERT downsamples ~75x so just use mean of mask blocks
+        # Downsample attention mask to match hidden state length
         T_out = hidden.shape[1]
-        # Approximate mask for hidden states
         attn_down = torch.nn.functional.interpolate(
             attention_mask.float().unsqueeze(1),
             size=T_out,
             mode='nearest'
         ).squeeze(1)  # (B, T')
 
-        # Attention pool each track
+        # Attention pool — runs in float32
         track_embeddings = []
         for i in range(hidden.shape[0]):
-            track_embeddings.append(
-                self.attn_pool(hidden[i], attn_down[i])
-            )
+            track_embeddings.append(self.attn_pool(hidden[i], attn_down[i]))
         track_embeddings = torch.stack(track_embeddings)  # (B, 768)
 
         return self.classifier(track_embeddings)           # (B, 16)
@@ -152,7 +153,7 @@ class MERTFMA(AbstractFMAGenreModule):
     # ----------------------------
     # Training
     # ----------------------------
-    def fma_train(self, train_dataset, val_dataset, epochs=100, batch_size=16, lr=3e-4):
+    def fma_train(self, train_dataset, val_dataset, epochs=100, batch_size=4, lr=3e-4):
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True,
             collate_fn=collate_mert, num_workers=2, pin_memory=True,
@@ -202,7 +203,6 @@ class MERTFMA(AbstractFMAGenreModule):
                 masks     = masks.to(self.device)
                 labels    = labels.to(self.device)
 
-                # Augmentation
                 waveforms = _add_gaussian_noise(waveforms)
 
                 optimizer.zero_grad()
@@ -262,11 +262,11 @@ class MERTFMA(AbstractFMAGenreModule):
             )
 
             state = {
-                'backbone_state_dict':    self.backbone.state_dict(),
-                'classifier_state_dict':  self.classifier.state_dict(),
-                'attn_pool_state_dict':   self.attn_pool.state_dict(),
-                'optimizer_state_dict':   optimizer.state_dict(),
-                'epoch':                  epoch,
+                'backbone_state_dict':   self.backbone.state_dict(),
+                'classifier_state_dict': self.classifier.state_dict(),
+                'attn_pool_state_dict':  self.attn_pool.state_dict(),
+                'optimizer_state_dict':  optimizer.state_dict(),
+                'epoch':                 epoch,
             }
             torch.save(state, checkpoint_path)
 
@@ -282,7 +282,7 @@ class MERTFMA(AbstractFMAGenreModule):
     # Testing
     # ----------------------------
     @torch.no_grad()
-    def fma_test(self, test_dataset, batch_size=16):
+    def fma_test(self, test_dataset, batch_size=4):
         test_loader = DataLoader(
             test_dataset, batch_size=batch_size, shuffle=False,
             collate_fn=collate_mert,
