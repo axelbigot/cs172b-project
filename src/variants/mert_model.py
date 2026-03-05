@@ -10,6 +10,11 @@ Optimized for A100 (40GB VRAM):
   - gradient accumulation x2 (effective batch_size=32)
   - early stopping patience=15
   - NaN detection
+
+Changes in this version:
+  - BACKBONE_LR_SCALE 0.001 -> 0.1 (backbone was barely updating at 1e-7, causing overfitting)
+  - Dropout 0.3 -> 0.5 (regularize classifier to reduce train/val gap)
+  - weight_decay 1e-4 -> 1e-3 (stronger L2 regularization)
 """
 import torch
 import torch.nn as nn
@@ -28,8 +33,8 @@ from src.fma.mert_dataset import MERTDataset, collate_mert
 MERT_MODEL_NAME      = "m-a-p/MERT-v1-95M"
 FREEZE_EPOCHS        = 5
 UNFREEZE_LAYERS      = 6
-BACKBONE_LR_SCALE    = 0.001
-BACKBONE_WARMUP      = 3
+BACKBONE_LR_SCALE    = 0.1    # CHANGED: was 0.001 — backbone gets 1e-5 LR instead of 1e-7
+BACKBONE_WARMUP      = 3      # epochs to linearly ramp backbone LR from 0 to target
 HIDDEN_DIM           = 768
 GRAD_ACCUM_STEPS     = 2
 EARLY_STOP_PATIENCE  = 15
@@ -81,11 +86,11 @@ class MERTFMA(AbstractFMAGenreModule):
             nn.Linear(HIDDEN_DIM, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.5),   # CHANGED: was 0.3 — higher dropout to fight overfitting
             nn.Linear(512, 256),
             nn.BatchNorm1d(256),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.5),   # CHANGED: was 0.3
             nn.Linear(256, 16),
         ).to(self.device)
 
@@ -153,12 +158,12 @@ class MERTFMA(AbstractFMAGenreModule):
     def _make_optimizer(self, lr: float, backbone_frozen: bool):
         head_params = list(self.classifier.parameters()) + list(self.attn_pool.parameters())
         if backbone_frozen:
-            return torch.optim.AdamW(head_params, lr=lr, weight_decay=1e-4)
+            return torch.optim.AdamW(head_params, lr=lr, weight_decay=1e-3)  # CHANGED: weight_decay 1e-4 -> 1e-3
         backbone_trainable = [p for p in self.backbone.parameters() if p.requires_grad]
         return torch.optim.AdamW([
-            {'params': backbone_trainable, 'lr': 0.0},
+            {'params': backbone_trainable, 'lr': 0.0},  # starts at 0, warmed up manually
             {'params': head_params,        'lr': lr},
-        ], weight_decay=1e-4)
+        ], weight_decay=1e-3)  # CHANGED: weight_decay 1e-4 -> 1e-3
 
     def fma_train(self, train_dataset, val_dataset, epochs=100, batch_size=16, lr=1e-4):
         train_loader = DataLoader(
@@ -178,7 +183,7 @@ class MERTFMA(AbstractFMAGenreModule):
         best_val_acc = 0.0
         epochs_no_improve = 0
         unfreeze_epoch = FREEZE_EPOCHS + 1
-        target_backbone_lr = lr * BACKBONE_LR_SCALE
+        target_backbone_lr = lr * BACKBONE_LR_SCALE  # 1e-4 * 0.1 = 1e-5
 
         logging.info("[MERT] Freezing backbone for first %d epochs", FREEZE_EPOCHS)
         self._freeze_backbone()
@@ -197,6 +202,7 @@ class MERTFMA(AbstractFMAGenreModule):
                     optimizer, T_max=epochs - FREEZE_EPOCHS, eta_min=lr * 0.01
                 )
 
+            # Linear warmup: backbone LR ramps from 0 to target over BACKBONE_WARMUP epochs
             if epoch >= unfreeze_epoch:
                 warmup_progress = min(1.0, (epoch - unfreeze_epoch) / BACKBONE_WARMUP)
                 current_backbone_lr = target_backbone_lr * warmup_progress
