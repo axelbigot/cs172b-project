@@ -5,7 +5,7 @@ MERT-v1-95M backbone for FMA genre classification.
 Optimized for A100 (40GB VRAM):
   - 30-second waveforms
   - batch_size=16
-  - 6 unfrozen transformer layers
+  - 6 unfrozen transformer layers with linear LR warmup
   - fp16 backbone
   - gradient accumulation x2 (effective batch_size=32)
   - early stopping patience=15
@@ -27,10 +27,11 @@ from src.fma.mert_dataset import MERTDataset, collate_mert
 
 MERT_MODEL_NAME      = "m-a-p/MERT-v1-95M"
 FREEZE_EPOCHS        = 5
-UNFREEZE_LAYERS      = 6      # unfreeze last 6 transformer layers on A100
-BACKBONE_LR_SCALE    = 0.01   # backbone LR = base_lr * this
+UNFREEZE_LAYERS      = 6
+BACKBONE_LR_SCALE    = 0.001   # very conservative — prevents NaN on unfreeze
+BACKBONE_WARMUP      = 3       # epochs to linearly ramp backbone LR from 0 to target
 HIDDEN_DIM           = 768
-GRAD_ACCUM_STEPS     = 2      # effective batch_size = 16 * 2 = 32
+GRAD_ACCUM_STEPS     = 2
 EARLY_STOP_PATIENCE  = 15
 
 
@@ -140,16 +141,13 @@ class MERTFMA(AbstractFMAGenreModule):
     def _partial_unfreeze_backbone(self):
         for param in self.backbone.parameters():
             param.requires_grad = False
-
         encoder_layers = self.backbone.encoder.layers
         for layer in encoder_layers[-UNFREEZE_LAYERS:]:
             for param in layer.parameters():
                 param.requires_grad = True
-
         if hasattr(self.backbone, 'layer_norm'):
             for param in self.backbone.layer_norm.parameters():
                 param.requires_grad = True
-
         n_trainable = sum(p.numel() for p in self.backbone.parameters() if p.requires_grad)
         logging.info(f"[MERT] Partial unfreeze: last {UNFREEZE_LAYERS} layers, {n_trainable:,} backbone params trainable")
 
@@ -159,7 +157,7 @@ class MERTFMA(AbstractFMAGenreModule):
             return torch.optim.AdamW(head_params, lr=lr, weight_decay=1e-4)
         backbone_trainable = [p for p in self.backbone.parameters() if p.requires_grad]
         return torch.optim.AdamW([
-            {'params': backbone_trainable, 'lr': lr * BACKBONE_LR_SCALE},
+            {'params': backbone_trainable, 'lr': 0.0},  # start at 0, warmed up manually
             {'params': head_params,        'lr': lr},
         ], weight_decay=1e-4)
 
@@ -180,6 +178,8 @@ class MERTFMA(AbstractFMAGenreModule):
         best_checkpoint_path = Path(DATA_DIRECTORY) / f"{idstr}-best.pt"
         best_val_acc = 0.0
         epochs_no_improve = 0
+        unfreeze_epoch = FREEZE_EPOCHS + 1  # epoch when backbone was unfrozen
+        target_backbone_lr = lr * BACKBONE_LR_SCALE
 
         logging.info("[MERT] Freezing backbone for first %d epochs", FREEZE_EPOCHS)
         self._freeze_backbone()
@@ -190,13 +190,21 @@ class MERTFMA(AbstractFMAGenreModule):
 
         for epoch in range(1, epochs + 1):
 
-            if epoch == FREEZE_EPOCHS + 1:
+            # Partial unfreeze at epoch 6
+            if epoch == unfreeze_epoch:
                 logging.info("[MERT] Partially unfreezing last %d transformer layers", UNFREEZE_LAYERS)
                 self._partial_unfreeze_backbone()
                 optimizer = self._make_optimizer(lr, backbone_frozen=False)
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                     optimizer, T_max=epochs - FREEZE_EPOCHS, eta_min=lr * 0.01
                 )
+
+            # Linear warmup for backbone LR over BACKBONE_WARMUP epochs after unfreeze
+            if epoch >= unfreeze_epoch:
+                warmup_progress = min(1.0, (epoch - unfreeze_epoch) / BACKBONE_WARMUP)
+                current_backbone_lr = target_backbone_lr * warmup_progress
+                optimizer.param_groups[0]['lr'] = current_backbone_lr
+                logging.info(f"[MERT] Backbone LR: {current_backbone_lr:.2e} (warmup {warmup_progress:.0%})")
 
             # -------- Train --------
             self.backbone.train()
