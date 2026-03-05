@@ -2,7 +2,7 @@
 src/variants/mert_model.py
 
 MERT-v1-95M backbone for FMA genre classification.
-Optimized for A100 (40GB VRAM):
+A100 (40GB VRAM) configuration:
   - 30-second waveforms
   - batch_size=16
   - float32 backbone (prevents NaN on unfreeze)
@@ -11,10 +11,11 @@ Optimized for A100 (40GB VRAM):
   - early stopping patience=15
   - NaN detection
 
-Changes in this version:
+Changes vs original:
   - BACKBONE_LR_SCALE 0.001 -> 0.1 (backbone was barely updating at 1e-7, causing overfitting)
   - Dropout 0.3 -> 0.5 (regularize classifier to reduce train/val gap)
   - weight_decay 1e-4 -> 1e-3 (stronger L2 regularization)
+  - fp16 -> float32 backbone (prevents NaN on unfreeze)
 """
 import torch
 import torch.nn as nn
@@ -33,10 +34,10 @@ from src.fma.mert_dataset import MERTDataset, collate_mert
 MERT_MODEL_NAME      = "m-a-p/MERT-v1-95M"
 FREEZE_EPOCHS        = 5
 UNFREEZE_LAYERS      = 6
-BACKBONE_LR_SCALE    = 0.1    # CHANGED: was 0.001 — backbone gets 1e-5 LR instead of 1e-7
+BACKBONE_LR_SCALE    = 0.1    # backbone gets 1e-5 LR — high enough to actually adapt
 BACKBONE_WARMUP      = 3      # epochs to linearly ramp backbone LR from 0 to target
 HIDDEN_DIM           = 768
-GRAD_ACCUM_STEPS     = 2
+GRAD_ACCUM_STEPS     = 2      # effective batch_size = 16 * 2 = 32
 EARLY_STOP_PATIENCE  = 15
 
 
@@ -86,11 +87,11 @@ class MERTFMA(AbstractFMAGenreModule):
             nn.Linear(HIDDEN_DIM, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(),
-            nn.Dropout(0.5),   # CHANGED: was 0.3 — higher dropout to fight overfitting
+            nn.Dropout(0.5),   # higher dropout to fight overfitting
             nn.Linear(512, 256),
             nn.BatchNorm1d(256),
             nn.ReLU(),
-            nn.Dropout(0.5),   # CHANGED: was 0.3
+            nn.Dropout(0.5),
             nn.Linear(256, 16),
         ).to(self.device)
 
@@ -158,12 +159,12 @@ class MERTFMA(AbstractFMAGenreModule):
     def _make_optimizer(self, lr: float, backbone_frozen: bool):
         head_params = list(self.classifier.parameters()) + list(self.attn_pool.parameters())
         if backbone_frozen:
-            return torch.optim.AdamW(head_params, lr=lr, weight_decay=1e-3)  # CHANGED: weight_decay 1e-4 -> 1e-3
+            return torch.optim.AdamW(head_params, lr=lr, weight_decay=1e-3)
         backbone_trainable = [p for p in self.backbone.parameters() if p.requires_grad]
         return torch.optim.AdamW([
             {'params': backbone_trainable, 'lr': 0.0},  # starts at 0, warmed up manually
             {'params': head_params,        'lr': lr},
-        ], weight_decay=1e-3)  # CHANGED: weight_decay 1e-4 -> 1e-3
+        ], weight_decay=1e-3)
 
     def fma_train(self, train_dataset, val_dataset, epochs=100, batch_size=16, lr=1e-4):
         train_loader = DataLoader(
