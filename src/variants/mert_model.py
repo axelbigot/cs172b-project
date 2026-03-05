@@ -2,11 +2,14 @@
 src/variants/mert_model.py
 
 MERT-v1-95M backbone for FMA genre classification.
-  - Raw waveform input at 24kHz
-  - fp16 backbone + gradient checkpointing to fit in 15GB VRAM
-  - batch_size=4 default
-  - Attention pooling over time steps -> single track embedding
-  - Classifier head 768 -> 512 -> 256 -> 16
+Optimized for A100 (40GB VRAM):
+  - 30-second waveforms
+  - batch_size=16
+  - 6 unfrozen transformer layers
+  - fp16 backbone
+  - gradient accumulation x2 (effective batch_size=32)
+  - early stopping patience=15
+  - NaN detection
 """
 import torch
 import torch.nn as nn
@@ -22,12 +25,13 @@ from src.model_analyzer import TrainingVisualizer
 from src.constants import DATA_DIRECTORY
 from src.fma.mert_dataset import MERTDataset, collate_mert
 
-MERT_MODEL_NAME   = "m-a-p/MERT-v1-95M"
-FREEZE_EPOCHS     = 5
-BACKBONE_LR_SCALE = 0.05
-HIDDEN_DIM        = 768
-GRAD_ACCUM_STEPS  = 4   # simulate batch_size=16
-EARLY_STOP_PATIENCE = 10  # stop if val acc does not improve for this many epochs
+MERT_MODEL_NAME      = "m-a-p/MERT-v1-95M"
+FREEZE_EPOCHS        = 5
+UNFREEZE_LAYERS      = 6      # unfreeze last 6 transformer layers on A100
+BACKBONE_LR_SCALE    = 0.01   # backbone LR = base_lr * this
+HIDDEN_DIM           = 768
+GRAD_ACCUM_STEPS     = 2      # effective batch_size = 16 * 2 = 32
+EARLY_STOP_PATIENCE  = 15
 
 
 # ---------------------------------------------------------------------------
@@ -40,12 +44,11 @@ class AttentionPool(nn.Module):
         self.v = nn.Linear(dim, 1, bias=False)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        # x: (T, dim),  mask: (T,) 1=real 0=pad
-        scores = self.v(torch.tanh(self.W(x.float())))     # (T, 1) — float32 for stability
+        scores = self.v(torch.tanh(self.W(x.float())))
         if mask is not None:
             scores = scores.masked_fill(mask.unsqueeze(-1) == 0, -1e9)
-        weights = torch.softmax(scores, dim=0)              # (T, 1)
-        return (weights * x.float()).sum(dim=0)             # (dim,)
+        weights = torch.softmax(scores, dim=0)
+        return (weights * x.float()).sum(dim=0)
 
 
 # ---------------------------------------------------------------------------
@@ -64,18 +67,15 @@ class MERTFMA(AbstractFMAGenreModule):
         self.tag = tag
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        logging.info(f"[MERT] Loading {MERT_MODEL_NAME} in fp16 with gradient checkpointing")
+        logging.info(f"[MERT] Loading {MERT_MODEL_NAME} in fp16")
         self.backbone = AutoModel.from_pretrained(
             MERT_MODEL_NAME,
             trust_remote_code=True,
             torch_dtype=torch.float16,
         ).to(self.device)
 
-        # Gradient checkpointing — recomputes activations on backward pass
-        # trades ~20% speed for ~40% VRAM savings
         self.backbone.gradient_checkpointing_enable()
 
-        # Classifier in float32 for stability
         self.attn_pool = AttentionPool(HIDDEN_DIM).to(self.device)
         self.classifier = nn.Sequential(
             nn.Linear(HIDDEN_DIM, 512),
@@ -93,37 +93,27 @@ class MERTFMA(AbstractFMAGenreModule):
     def name(cls):
         return "mert"
 
-    # ----------------------------
-    # Forward
-    # ----------------------------
     def forward(self, waveforms: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        # Cast waveforms to fp16 for backbone
         outputs = self.backbone(
             input_values=waveforms.half(),
             attention_mask=attention_mask,
             output_hidden_states=False,
         )
-        hidden = outputs.last_hidden_state  # (B, T', 768) fp16
+        hidden = outputs.last_hidden_state  # (B, T', 768)
 
-        # Downsample attention mask to match hidden state length
         T_out = hidden.shape[1]
         attn_down = torch.nn.functional.interpolate(
             attention_mask.float().unsqueeze(1),
-            size=T_out,
-            mode='nearest'
-        ).squeeze(1)  # (B, T')
+            size=T_out, mode='nearest'
+        ).squeeze(1)
 
-        # Attention pool — runs in float32
         track_embeddings = []
         for i in range(hidden.shape[0]):
             track_embeddings.append(self.attn_pool(hidden[i], attn_down[i]))
-        track_embeddings = torch.stack(track_embeddings)  # (B, 768)
+        track_embeddings = torch.stack(track_embeddings)
 
-        return self.classifier(track_embeddings)           # (B, 16)
+        return self.classifier(track_embeddings)
 
-    # ----------------------------
-    # AbstractFMAGenreModule overrides
-    # ----------------------------
     @classmethod
     def train_generic(cls, train_dataset, val_dataset, **kwargs):
         model = cls(tag=kwargs.get('tag', ''))
@@ -143,26 +133,44 @@ class MERTFMA(AbstractFMAGenreModule):
             f'_{base_dataset.__class__.__name__}_frac-{frac}'
         )
 
+    def _freeze_backbone(self):
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+    def _partial_unfreeze_backbone(self):
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        encoder_layers = self.backbone.encoder.layers
+        for layer in encoder_layers[-UNFREEZE_LAYERS:]:
+            for param in layer.parameters():
+                param.requires_grad = True
+
+        if hasattr(self.backbone, 'layer_norm'):
+            for param in self.backbone.layer_norm.parameters():
+                param.requires_grad = True
+
+        n_trainable = sum(p.numel() for p in self.backbone.parameters() if p.requires_grad)
+        logging.info(f"[MERT] Partial unfreeze: last {UNFREEZE_LAYERS} layers, {n_trainable:,} backbone params trainable")
+
     def _make_optimizer(self, lr: float, backbone_frozen: bool):
         head_params = list(self.classifier.parameters()) + list(self.attn_pool.parameters())
         if backbone_frozen:
             return torch.optim.AdamW(head_params, lr=lr, weight_decay=1e-4)
+        backbone_trainable = [p for p in self.backbone.parameters() if p.requires_grad]
         return torch.optim.AdamW([
-            {'params': self.backbone.parameters(), 'lr': lr * BACKBONE_LR_SCALE},
-            {'params': head_params,                'lr': lr},
+            {'params': backbone_trainable, 'lr': lr * BACKBONE_LR_SCALE},
+            {'params': head_params,        'lr': lr},
         ], weight_decay=1e-4)
 
-    # ----------------------------
-    # Training
-    # ----------------------------
-    def fma_train(self, train_dataset, val_dataset, epochs=100, batch_size=4, lr=3e-4):
+    def fma_train(self, train_dataset, val_dataset, epochs=100, batch_size=16, lr=1e-4):
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True,
-            collate_fn=collate_mert, num_workers=2, pin_memory=True, drop_last=True,
+            collate_fn=collate_mert, num_workers=4, pin_memory=True, drop_last=True,
         )
         val_loader = DataLoader(
             val_dataset, batch_size=batch_size, shuffle=False,
-            collate_fn=collate_mert, num_workers=2, pin_memory=True,
+            collate_fn=collate_mert, num_workers=4, pin_memory=True,
         )
 
         criterion = nn.CrossEntropyLoss()
@@ -173,11 +181,8 @@ class MERTFMA(AbstractFMAGenreModule):
         best_val_acc = 0.0
         epochs_no_improve = 0
 
-        # Phase 1: freeze backbone
         logging.info("[MERT] Freezing backbone for first %d epochs", FREEZE_EPOCHS)
-        for param in self.backbone.parameters():
-            param.requires_grad = False
-
+        self._freeze_backbone()
         optimizer = self._make_optimizer(lr, backbone_frozen=True)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=FREEZE_EPOCHS, eta_min=lr * 0.1
@@ -185,11 +190,9 @@ class MERTFMA(AbstractFMAGenreModule):
 
         for epoch in range(1, epochs + 1):
 
-            # Phase 2: unfreeze backbone
             if epoch == FREEZE_EPOCHS + 1:
-                logging.info("[MERT] Unfreezing backbone (backbone LR = %.2e)", lr * BACKBONE_LR_SCALE)
-                for param in self.backbone.parameters():
-                    param.requires_grad = True
+                logging.info("[MERT] Partially unfreezing last %d transformer layers", UNFREEZE_LAYERS)
+                self._partial_unfreeze_backbone()
                 optimizer = self._make_optimizer(lr, backbone_frozen=False)
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                     optimizer, T_max=epochs - FREEZE_EPOCHS, eta_min=lr * 0.01
@@ -200,6 +203,7 @@ class MERTFMA(AbstractFMAGenreModule):
             self.classifier.train()
             self.attn_pool.train()
             train_loss, train_correct = 0.0, 0
+            nan_detected = False
 
             optimizer.zero_grad()
             for step, (waveforms, masks, labels, _) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch} Training")):
@@ -211,6 +215,12 @@ class MERTFMA(AbstractFMAGenreModule):
 
                 logits = self.forward(waveforms, masks)
                 loss = criterion(logits, labels) / GRAD_ACCUM_STEPS
+
+                if torch.isnan(loss):
+                    logging.error("[MERT] NaN loss at epoch %d step %d — stopping", epoch, step)
+                    nan_detected = True
+                    break
+
                 loss.backward()
 
                 if (step + 1) % GRAD_ACCUM_STEPS == 0:
@@ -220,6 +230,10 @@ class MERTFMA(AbstractFMAGenreModule):
 
                 train_loss    += loss.item() * GRAD_ACCUM_STEPS * labels.size(0)
                 train_correct += (logits.argmax(1) == labels).sum().item()
+
+            if nan_detected:
+                print(f"NaN detected at epoch {epoch} — stopping. Lower BACKBONE_LR_SCALE.")
+                break
 
             scheduler.step()
             train_loss /= len(train_dataset)
@@ -285,18 +299,15 @@ class MERTFMA(AbstractFMAGenreModule):
                 epochs_no_improve += 1
                 logging.info("[MERT] No improvement for %d/%d epochs", epochs_no_improve, EARLY_STOP_PATIENCE)
                 if epochs_no_improve >= EARLY_STOP_PATIENCE:
-                    logging.info("[MERT] Early stopping triggered at epoch %d", epoch)
+                    logging.info("[MERT] Early stopping at epoch %d", epoch)
                     print(f"Early stopping at epoch {epoch} — no improvement for {EARLY_STOP_PATIENCE} epochs")
                     break
 
         logging.info("[MERT] Best val acc: %.4f", best_val_acc)
         return visualizer
 
-    # ----------------------------
-    # Testing
-    # ----------------------------
     @torch.no_grad()
-    def fma_test(self, test_dataset, batch_size=4):
+    def fma_test(self, test_dataset, batch_size=16):
         test_loader = DataLoader(
             test_dataset, batch_size=batch_size, shuffle=False,
             collate_fn=collate_mert,
