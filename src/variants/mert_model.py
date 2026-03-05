@@ -5,8 +5,8 @@ MERT-v1-95M backbone for FMA genre classification.
 Optimized for A100 (40GB VRAM):
   - 30-second waveforms
   - batch_size=16
+  - float32 backbone (prevents NaN on unfreeze)
   - 6 unfrozen transformer layers with linear LR warmup
-  - fp16 backbone
   - gradient accumulation x2 (effective batch_size=32)
   - early stopping patience=15
   - NaN detection
@@ -28,8 +28,8 @@ from src.fma.mert_dataset import MERTDataset, collate_mert
 MERT_MODEL_NAME      = "m-a-p/MERT-v1-95M"
 FREEZE_EPOCHS        = 5
 UNFREEZE_LAYERS      = 6
-BACKBONE_LR_SCALE    = 0.001   # very conservative — prevents NaN on unfreeze
-BACKBONE_WARMUP      = 3       # epochs to linearly ramp backbone LR from 0 to target
+BACKBONE_LR_SCALE    = 0.001
+BACKBONE_WARMUP      = 3
 HIDDEN_DIM           = 768
 GRAD_ACCUM_STEPS     = 2
 EARLY_STOP_PATIENCE  = 15
@@ -45,11 +45,11 @@ class AttentionPool(nn.Module):
         self.v = nn.Linear(dim, 1, bias=False)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        scores = self.v(torch.tanh(self.W(x.float())))
+        scores = self.v(torch.tanh(self.W(x)))
         if mask is not None:
             scores = scores.masked_fill(mask.unsqueeze(-1) == 0, -1e9)
         weights = torch.softmax(scores, dim=0)
-        return (weights * x.float()).sum(dim=0)
+        return (weights * x).sum(dim=0)
 
 
 # ---------------------------------------------------------------------------
@@ -68,11 +68,10 @@ class MERTFMA(AbstractFMAGenreModule):
         self.tag = tag
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        logging.info(f"[MERT] Loading {MERT_MODEL_NAME} in fp16")
+        logging.info(f"[MERT] Loading {MERT_MODEL_NAME} in float32")
         self.backbone = AutoModel.from_pretrained(
             MERT_MODEL_NAME,
             trust_remote_code=True,
-            torch_dtype=torch.float16,
         ).to(self.device)
 
         self.backbone.gradient_checkpointing_enable()
@@ -96,11 +95,11 @@ class MERTFMA(AbstractFMAGenreModule):
 
     def forward(self, waveforms: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         outputs = self.backbone(
-            input_values=waveforms.half(),
+            input_values=waveforms,
             attention_mask=attention_mask,
             output_hidden_states=False,
         )
-        hidden = outputs.last_hidden_state  # (B, T', 768)
+        hidden = outputs.last_hidden_state  # (B, T', 768) float32
 
         T_out = hidden.shape[1]
         attn_down = torch.nn.functional.interpolate(
@@ -157,7 +156,7 @@ class MERTFMA(AbstractFMAGenreModule):
             return torch.optim.AdamW(head_params, lr=lr, weight_decay=1e-4)
         backbone_trainable = [p for p in self.backbone.parameters() if p.requires_grad]
         return torch.optim.AdamW([
-            {'params': backbone_trainable, 'lr': 0.0},  # start at 0, warmed up manually
+            {'params': backbone_trainable, 'lr': 0.0},
             {'params': head_params,        'lr': lr},
         ], weight_decay=1e-4)
 
@@ -178,7 +177,7 @@ class MERTFMA(AbstractFMAGenreModule):
         best_checkpoint_path = Path(DATA_DIRECTORY) / f"{idstr}-best.pt"
         best_val_acc = 0.0
         epochs_no_improve = 0
-        unfreeze_epoch = FREEZE_EPOCHS + 1  # epoch when backbone was unfrozen
+        unfreeze_epoch = FREEZE_EPOCHS + 1
         target_backbone_lr = lr * BACKBONE_LR_SCALE
 
         logging.info("[MERT] Freezing backbone for first %d epochs", FREEZE_EPOCHS)
@@ -190,7 +189,6 @@ class MERTFMA(AbstractFMAGenreModule):
 
         for epoch in range(1, epochs + 1):
 
-            # Partial unfreeze at epoch 6
             if epoch == unfreeze_epoch:
                 logging.info("[MERT] Partially unfreezing last %d transformer layers", UNFREEZE_LAYERS)
                 self._partial_unfreeze_backbone()
@@ -199,7 +197,6 @@ class MERTFMA(AbstractFMAGenreModule):
                     optimizer, T_max=epochs - FREEZE_EPOCHS, eta_min=lr * 0.01
                 )
 
-            # Linear warmup for backbone LR over BACKBONE_WARMUP epochs after unfreeze
             if epoch >= unfreeze_epoch:
                 warmup_progress = min(1.0, (epoch - unfreeze_epoch) / BACKBONE_WARMUP)
                 current_backbone_lr = target_backbone_lr * warmup_progress
@@ -240,7 +237,7 @@ class MERTFMA(AbstractFMAGenreModule):
                 train_correct += (logits.argmax(1) == labels).sum().item()
 
             if nan_detected:
-                print(f"NaN detected at epoch {epoch} — stopping. Lower BACKBONE_LR_SCALE.")
+                print(f"NaN detected at epoch {epoch} — stopping.")
                 break
 
             scheduler.step()
