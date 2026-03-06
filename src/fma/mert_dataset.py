@@ -1,9 +1,12 @@
 """
 src/fma/mert_dataset.py
 
-Loads raw waveforms from FMA small at 24kHz for MERT.
+Loads raw waveforms from FMA at 24kHz for MERT.
 Caches individual track files to disk on first run.
-On subsequent runs, preloads all waveforms into RAM for fast batch access.
+
+RAM preload strategy (auto-selected by dataset size):
+  - FMA small  (~6,400 tracks)  : preload all into RAM for fast iteration
+  - FMA medium (~25,000 tracks) : load from disk per batch (72GB RAM would OOM)
 """
 from src.fma.fma_dataset import VariableFMADataset
 from pathlib import Path
@@ -17,7 +20,8 @@ from tqdm import tqdm
 from src.constants import DATA_DIRECTORY
 
 MERT_SAMPLE_RATE = 24000
-MAX_DURATION_SEC = 30  # full 30 seconds — A100 has enough VRAM
+MAX_DURATION_SEC = 30       # full 30 seconds
+RAM_PRELOAD_THRESHOLD = 8000  # CHANGED: only preload to RAM if dataset <= this size
 
 
 def load_audio_mert(audio: np.ndarray, orig_sr: int) -> torch.Tensor:
@@ -31,8 +35,10 @@ def load_audio_mert(audio: np.ndarray, orig_sr: int) -> torch.Tensor:
 class MERTDataset(VariableFMADataset):
     """
     Extends VariableFMADataset — precomputes 24kHz waveforms and caches
-    each track as a separate file on disk. On load, preloads all into RAM
-    for fast iteration during training.
+    each track as a separate file on disk.
+
+    For small datasets (<=8000 tracks): preloads all into RAM for fast iteration.
+    For large datasets (>8000 tracks): loads from disk per batch to avoid OOM.
 
     __getitem__ returns:
         waveform : (T,)  float32 tensor
@@ -56,13 +62,19 @@ class MERTDataset(VariableFMADataset):
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             self._precompute(orig_sr)
 
-        # Preload all waveforms into RAM for fast training
-        logging.info(f"[MERTDataset] Preloading {len(self.wave_labels_)} waveforms into RAM...")
-        self.ram_cache_ = [
-            torch.load(self.cache_dir / f"track_{self.valid_indices_[i]}.pt")
-            for i in tqdm(range(len(self.wave_labels_)), desc="Loading to RAM")
-        ]
-        logging.info("[MERTDataset] RAM preload complete")
+        # CHANGED: only preload to RAM for small datasets to avoid OOM on medium/large
+        self.use_ram_cache_ = len(self.wave_labels_) <= RAM_PRELOAD_THRESHOLD
+        if self.use_ram_cache_:
+            logging.info(f"[MERTDataset] Preloading {len(self.wave_labels_)} waveforms into RAM...")
+            self.ram_cache_ = [
+                torch.load(self.cache_dir / f"track_{self.valid_indices_[i]}.pt")
+                for i in tqdm(range(len(self.wave_labels_)), desc="Loading to RAM")
+            ]
+            logging.info("[MERTDataset] RAM preload complete")
+        else:
+            # CHANGED: skip RAM preload for large datasets, load from disk per batch
+            logging.info(f"[MERTDataset] Large dataset ({len(self.wave_labels_)} tracks) — loading from disk per batch")
+            self.ram_cache_ = None
 
     def _precompute(self, orig_sr: int):
         labels_list = []
@@ -87,7 +99,14 @@ class MERTDataset(VariableFMADataset):
         logging.info(f"[MERTDataset] Cached {len(valid_indices)} tracks to {self.cache_dir}")
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        return self.ram_cache_[index], self.wave_labels_[index], index
+        if self.use_ram_cache_:
+            # CHANGED: use RAM cache for small datasets
+            return self.ram_cache_[index], self.wave_labels_[index], index
+        else:
+            # CHANGED: load from disk for large datasets to avoid OOM
+            track_idx = self.valid_indices_[index]
+            waveform = torch.load(self.cache_dir / f"track_{track_idx}.pt")
+            return waveform, self.wave_labels_[index], index
 
     def __len__(self):
         return len(self.wave_labels_)
