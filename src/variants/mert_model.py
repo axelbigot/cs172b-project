@@ -52,7 +52,8 @@ class AttentionPool(nn.Module):
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         scores = self.v(torch.tanh(self.W(x)))
         if mask is not None:
-            scores = scores.masked_fill(mask.unsqueeze(-1) == 0, -1e9)
+            # CHANGED: -1e4 instead of -1e9 to avoid fp16 overflow under AMP
+            scores = scores.masked_fill(mask.unsqueeze(-1) == 0, -1e4)
         weights = torch.softmax(scores, dim=0)
         return (weights * x).sum(dim=0)
 
