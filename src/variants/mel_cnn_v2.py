@@ -19,7 +19,7 @@ class MelCNNFMAModelV2(AbstractFMAGenreModule):
 		@classmethod
 		def train_generic(cls, train_dataset: VariableFMADataset, val_dataset: VariableFMADataset, **kwargs):
 				model = cls(train_dataset.num_classes, **kwargs)
-				model.fma_train(train_dataset, val_dataset, batch_size=16, num_epochs=1000)
+				model.fma_train(train_dataset, val_dataset, batch_size=16, num_epochs=150)
 
 		@classmethod
 		def test_generic(cls, test_dataset: VariableFMADataset, **kwargs):
@@ -45,8 +45,8 @@ class MelCNNFMAModelV2(AbstractFMAGenreModule):
 				layers.append(nn.GroupNorm(num_groups=8, num_channels=conv_channels[-1]))
 				layers.append(nn.ReLU(inplace=True))
 				self.feature_extractor = nn.Sequential(*layers)
-				self.temporal_conv = nn.Conv1d(conv_channels[-1], conv_channels[-1], kernel_size=3, padding=1)
-				self.dropout = nn.Dropout(0.4)
+				self.temporal_conv = nn.Conv1d(conv_channels[-1], conv_channels[-1], kernel_size=5, padding=1)
+				self.dropout = nn.Dropout(0.3)
 				self.classifier = nn.Linear(conv_channels[-1], num_classes)
 
 		def forward(self, batch_X: torch.Tensor, ids: List[int] = None) -> torch.Tensor:
