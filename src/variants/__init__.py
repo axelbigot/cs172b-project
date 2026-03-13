@@ -1,7 +1,8 @@
 from src.variants.example import *
-from src.variants.mel_cnn import *
+from src.variants.crnn import *
 from src.variants.mfcc_cnn import *
 from src.variants.baseline import *
+from src.variants.mel_cnn import *
 from src.variants.mel_cnn_v2 import *
 
 __all__ = [
@@ -9,5 +10,6 @@ __all__ = [
 	'MelCNNFMAModel',
     'MFCC_CNNFMAModel',
 	'MelMLPFMAModel',
-	'MelCNNFMAModelV2'
+	'MelCNNFMAModelV2',
+    'CRNNGenreModel'
 ]
